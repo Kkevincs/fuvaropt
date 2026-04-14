@@ -1,5 +1,7 @@
 using System;
+using System.IO;
 using System.Threading;
+using DotNetEnv;
 using FuvarOpt.Mcp;
 using FuvarOpt.Models;
 using FuvarOpt.Options;
@@ -19,6 +21,7 @@ public static class Program
 {
     public static void Main(string[] args)
     {
+        LoadEnvFromRepoRoot();
         var builder = WebApplication.CreateBuilder(args);
 
         builder.Services.ConfigureHttpJsonOptions(o =>
@@ -87,49 +90,6 @@ public static class Program
         app.MapGet("/api/health", () => Results.Ok(new { status = "ok" }));
 
         app.MapPost(
-                "/api/route-problem",
-                ([FromBody] RouteProblemRequest? body) =>
-                {
-                    try
-                    {
-                        var req = body ?? new RouteProblemRequest();
-                        var result = RouteProblemBuilder.FromRequest(req);
-                        return Results.Ok(result);
-                    }
-                    catch (ArgumentException ex)
-                    {
-                        return Results.BadRequest(new { error = ex.Message });
-                    }
-                })
-            .WithName("CreateRouteProblem")
-            .Produces<RouteProblemResponse>(StatusCodes.Status200OK)
-            .Produces(StatusCodes.Status400BadRequest);
-
-        app.MapGet(
-                "/api/route-problem",
-                (
-                    [FromQuery] int vehicleCount = 0,
-                    [FromQuery] int addressCount = 0,
-                    [FromQuery] int warehouseCount = 0,
-                    [FromQuery] int packages = 0) =>
-                {
-                    try
-                    {
-                        var result = RouteProblemBuilder.FromCounts(
-                            vehicleCount,
-                            addressCount,
-                            warehouseCount,
-                            packages);
-                        return Results.Ok(result);
-                    }
-                    catch (ArgumentException ex)
-                    {
-                        return Results.BadRequest(new { error = ex.Message });
-                    }
-                })
-            .WithName("GetRouteProblem");
-
-        app.MapPost(
                 "/api/route-problem/from-message",
                 async (
                     RouteProblemFromMessageRequest? body,
@@ -165,42 +125,57 @@ public static class Program
             .Produces(StatusCodes.Status503ServiceUnavailable);
 
         app.MapPost(
-                "/api/route-problem/timefold",
-                (TimefoldProblemRequest? body) =>
+                "/api/route-problem/post-optimization-suggestions",
+                async (
+                    PostOptimizationSuggestionsRequest? body,
+                    GeminiRouteExtractionService gemini,
+                    CancellationToken cancellationToken) =>
                 {
-                    if (body is null)
+                    if (body is null || string.IsNullOrWhiteSpace(body.OptimizedRouteJson))
                     {
-                        return Results.BadRequest(new { error = "Body is required." });
+                        return Results.BadRequest(new { error = "OptimizedRouteJson is required." });
                     }
 
-                    if (string.IsNullOrWhiteSpace(body.Name))
+                    try
                     {
-                        return Results.BadRequest(new { error = "Name is required." });
+                        var result = await gemini
+                            .GetPostOptimizationSuggestionsAsync(body.OptimizedRouteJson, cancellationToken)
+                            .ConfigureAwait(false);
+                        return Results.Ok(result);
                     }
-
-                    if (body.Vehicles is null || body.Vehicles.Count == 0)
+                    catch (InvalidOperationException ex)
                     {
-                        return Results.BadRequest(new { error = "At least one vehicle is required." });
+                        return Results.Json(
+                            new { error = ex.Message },
+                            statusCode: StatusCodes.Status503ServiceUnavailable);
                     }
-
-                    if (body.SouthWestCorner is null || body.SouthWestCorner.Length < 2
-                        || body.NorthEastCorner is null || body.NorthEastCorner.Length < 2)
+                    catch (ArgumentException ex)
                     {
-                        return Results.BadRequest(new { error = "Bounding box must be [latitude, longitude] arrays." });
+                        return Results.BadRequest(new { error = ex.Message });
                     }
-
-                    if (body.SouthWestCorner[0] >= body.NorthEastCorner[0]
-                        || body.SouthWestCorner[1] >= body.NorthEastCorner[1])
-                    {
-                        return Results.BadRequest(new { error = "Invalid bounding box (south-west must be south/west of north-east)." });
-                    }
-
-                    return Results.Ok(new { ok = true, received = body.Name });
                 })
-            .WithName("SubmitTimefoldProblem")
-            .Produces<object>(StatusCodes.Status200OK)
-            .Produces(StatusCodes.Status400BadRequest);
+            .WithName("PostOptimizationSuggestions")
+            .Produces<PostOptimizationSuggestionsResponse>(StatusCodes.Status200OK)
+            .Produces(StatusCodes.Status400BadRequest)
+            .Produces(StatusCodes.Status503ServiceUnavailable);
 
         app.Run();
+    }
+
+    /// <summary>Loads the first <c>.env</c> found walking up from the current directory (repo root).</summary>
+    private static void LoadEnvFromRepoRoot()
+    {
+        var cur = new DirectoryInfo(Directory.GetCurrentDirectory());
+        while (cur != null)
+        {
+            var candidate = Path.Combine(cur.FullName, ".env");
+            if (File.Exists(candidate))
+            {
+                Env.Load(candidate);
+                return;
+            }
+
+            cur = cur.Parent;
+        }
     }
 }

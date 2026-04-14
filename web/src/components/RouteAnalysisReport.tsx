@@ -2,12 +2,26 @@ import { useMemo } from "react";
 import type { OptimalRoutePlan } from "../types/optimalRoutePlan";
 import { analyzeOptimalRoutePlan } from "../lib/analyzeOptimalRoutePlan";
 
+function stripLeadingBullet(text: string): string {
+  return text.replace(/^\s*[•\-\*]\s*/, "").trim();
+}
+
 type Props = {
   plan: OptimalRoutePlan;
+  /** Top Gemini insights (at most 3), shown as Action required cards. */
+  actionInsights?: string[] | null;
+  actionInsightsLoading?: boolean;
+  actionInsightsError?: string | null;
 };
 
-export function RouteAnalysisReport({ plan }: Props) {
+export function RouteAnalysisReport({
+  plan,
+  actionInsights = null,
+  actionInsightsLoading = false,
+  actionInsightsError = null,
+}: Props) {
   const r = useMemo(() => analyzeOptimalRoutePlan(plan), [plan]);
+  const topActions = (actionInsights ?? []).slice(0, 3).map(stripLeadingBullet).filter(Boolean);
 
   return (
     <div className="rounded-2xl border border-white/10 bg-slate-900/80 px-4 py-4 sm:px-5">
@@ -60,6 +74,55 @@ export function RouteAnalysisReport({ plan }: Props) {
       </dl>
 
       <p className="mt-3 text-xs leading-relaxed text-slate-500">{r.travelMetricNote}</p>
+
+      {(actionInsightsLoading ||
+        actionInsightsError !== null ||
+        topActions.length > 0) && (
+        <div className="mt-6 border-t border-white/10 pt-5">
+          <h4 className="text-xs font-semibold uppercase tracking-wide text-amber-200/90">
+            Action required
+          </h4>
+          <p className="mt-1 text-xs text-slate-500">
+            AI suggestions from your optimized route (Gemini). Review before changing operations.
+          </p>
+
+          {actionInsightsLoading && (
+            <div className="mt-4 grid gap-3 sm:grid-cols-3">
+              {[0, 1, 2].map((i) => (
+                <div
+                  key={i}
+                  className="animate-pulse rounded-xl border border-white/10 bg-slate-950/60 px-3 py-4"
+                >
+                  <div className="h-3 w-24 rounded bg-slate-700/80" />
+                  <div className="mt-3 h-10 rounded bg-slate-800/80" />
+                </div>
+              ))}
+            </div>
+          )}
+
+          {!actionInsightsLoading && actionInsightsError !== null && (
+            <p className="mt-3 rounded-xl border border-rose-500/30 bg-rose-950/40 px-3 py-2 text-sm text-rose-200">
+              {actionInsightsError}
+            </p>
+          )}
+
+          {!actionInsightsLoading && actionInsightsError === null && topActions.length > 0 && (
+            <div className="mt-4 grid gap-3 sm:grid-cols-3">
+              {topActions.map((text, idx) => (
+                <div
+                  key={idx}
+                  className="flex flex-col rounded-xl border border-amber-500/25 bg-amber-950/30 px-4 py-3 ring-1 ring-amber-500/10"
+                >
+                  <span className="text-[10px] font-semibold uppercase tracking-wide text-amber-400/90">
+                    Insight {idx + 1}
+                  </span>
+                  <p className="mt-2 text-sm leading-relaxed text-slate-100">{text}</p>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       {r.perVehicle.length > 0 && (
         <div className="mt-4 overflow-x-auto rounded-xl border border-white/10">

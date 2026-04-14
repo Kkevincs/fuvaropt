@@ -4,6 +4,10 @@ import {
   type RouteProblemResponse,
 } from "../types/routeProblem";
 import { parseOptimalRoutePlan, type OptimalRoutePlan } from "../types/optimalRoutePlan";
+import {
+  normalizePostOptimizationSuggestions,
+  type PostOptimizationSuggestionsResponse,
+} from "../types/postOptimizationSuggestions";
 import { serializeTimefoldPayload, type TimefoldApiPayload } from "../lib/buildTimefoldPayload";
 
 const defaultBase = "http://localhost:5078";
@@ -105,6 +109,31 @@ export async function postRouteProblemFromMessage(
     throw new Error(msg || `Request failed (${res.status})`);
   }
   return normalizeRouteProblemResponse(JSON.parse(text) as unknown);
+}
+
+export async function postOptimizationSuggestions(
+  optimizedRouteJson: string,
+): Promise<PostOptimizationSuggestionsResponse> {
+  const res = await fetch(`${getApiBaseUrl()}/api/route-problem/post-optimization-suggestions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ optimizedRouteJson }),
+  });
+  const text = await res.text();
+  logServerResponse(res, text);
+  if (!res.ok) {
+    let msg = text;
+    try {
+      const j = JSON.parse(text) as { error?: string };
+      if (j.error) {
+        msg = j.error;
+      }
+    } catch {
+      /* use raw */
+    }
+    throw new Error(msg || `Suggestions request failed (${res.status})`);
+  }
+  return normalizePostOptimizationSuggestions(JSON.parse(text) as unknown);
 }
 
 /** POST final Timefold JSON to route-plans service; returns job id for GET result. */

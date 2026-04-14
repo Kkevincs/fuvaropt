@@ -7,12 +7,22 @@ import {
   pinKindLabels,
 } from "./RouteMap";
 import { RouteAnalysisReport } from "./RouteAnalysisReport";
-import { fetchRoutePlanResult, postRoutePlanJob, postRouteProblemFromMessage } from "../api/client";
+import {
+  fetchRoutePlanResult,
+  postOptimizationSuggestions,
+  postRoutePlanJob,
+  postRouteProblemFromMessage,
+} from "../api/client";
 import {
   VEHICLE_CAPACITY_TEST,
   buildTimefoldApiPayload,
   serializeTimefoldPayload,
 } from "../lib/buildTimefoldPayload";
+import {
+  buildMissingDetailsPrompt,
+  getMissingRouteFields,
+  isRouteProblemComplete,
+} from "../lib/routeProblemChat";
 import type { OptimalRoutePlan } from "../types/optimalRoutePlan";
 import type { RouteProblemResponse } from "../types/routeProblem";
 
@@ -25,7 +35,7 @@ type ChatMessage = {
 };
 
 const introText =
-  "Tell me about the deliveries. You can mention how many warehouses, delivery addresses, vehicles, and packages you need—we will turn that into counts for the map.";
+  "Tell me about the deliveries. Mention how many warehouses, delivery addresses, and vehicles you need. If you skip a number, I will ask until we have all three.";
 
 /** Only warehouse and delivery pins are quota-driven from the API. */
 const pinKinds: MapPinKind[] = ["warehouse", "delivery"];
@@ -40,6 +50,8 @@ export function ChatPanel() {
   const [draft, setDraft] = useState("");
   const [chatError, setChatError] = useState<string | null>(null);
   const [chatLoading, setChatLoading] = useState(false);
+  /** User lines sent so far; combined and re-sent to extraction until all counts are positive. */
+  const [extractionMessageParts, setExtractionMessageParts] = useState<string[]>([]);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   const [activePinKind, setActivePinKind] = useState<MapPinKind>("warehouse");
@@ -52,6 +64,12 @@ export function ChatPanel() {
   const [routePlanJobId, setRoutePlanJobId] = useState<string | null>(null);
   const [fetchResultLoading, setFetchResultLoading] = useState(false);
   const [optimalRoute, setOptimalRoute] = useState<OptimalRoutePlan | null>(null);
+  /** Top 3 Gemini post-optimization suggestions (shown under Route analysis, not in chat). */
+  const [actionInsights, setActionInsights] = useState<string[] | null>(null);
+  const [actionInsightsLoading, setActionInsightsLoading] = useState(false);
+  const [actionInsightsError, setActionInsightsError] = useState<string | null>(null);
+  /** Skip duplicate Gemini calls when reloading the same job id. */
+  const insightsFetchedForJobIdRef = useRef<string | null>(null);
 
   const selectedPin = useMemo(
     () => (selectedPinId === null ? null : mapPins.find((p) => p.id === selectedPinId) ?? null),
@@ -74,8 +92,21 @@ export function ChatPanel() {
     setDraft("");
     setMessages((prev) => [...prev, { id: crypto.randomUUID(), role: "user", text }]);
 
+    const combinedMessage = [...extractionMessageParts, text].join("\n\n");
+
     try {
-      const res = await postRouteProblemFromMessage({ message: text });
+      const res = await postRouteProblemFromMessage({ message: combinedMessage });
+      if (!isRouteProblemComplete(res)) {
+        setExtractionMessageParts((prev) => [...prev, text]);
+        const missing = getMissingRouteFields(res);
+        const followUp = buildMissingDetailsPrompt(missing);
+        setMessages((prev) => [
+          ...prev,
+          { id: crypto.randomUUID(), role: "assistant", text: followUp },
+        ]);
+        return;
+      }
+      setExtractionMessageParts([]);
       setRouteProblem(res);
       setPhase("map");
       setMapPins([]);
@@ -159,7 +190,10 @@ export function ChatPanel() {
       );
       const jobId = await postRoutePlanJob(payload);
       setRoutePlanJobId(jobId);
+      insightsFetchedForJobIdRef.current = null;
       setOptimalRoute(null);
+      setActionInsights(null);
+      setActionInsightsError(null);
       setSelectedPinId(null);
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Submit failed.";
@@ -173,12 +207,34 @@ export function ChatPanel() {
     if (routePlanJobId === null || routePlanJobId === "") {
       return;
     }
+    const jobId = routePlanJobId;
     setSendError(null);
     setFetchResultLoading(true);
     try {
-      const plan = await fetchRoutePlanResult(routePlanJobId);
+      const plan = await fetchRoutePlanResult(jobId);
       setOptimalRoute(plan);
       setSelectedPinId(null);
+
+      if (insightsFetchedForJobIdRef.current !== jobId) {
+        setActionInsights(null);
+        setActionInsightsError(null);
+        setActionInsightsLoading(true);
+        try {
+          const ins = await postOptimizationSuggestions(JSON.stringify(plan));
+          insightsFetchedForJobIdRef.current = jobId;
+          setActionInsights(ins.suggestions.slice(0, 3));
+          setActionInsightsError(null);
+        } catch (err) {
+          setActionInsights(null);
+          setActionInsightsError(
+            err instanceof Error
+              ? err.message
+              : "Could not load AI suggestions. Check FuvarOpt and Gemini configuration.",
+          );
+        } finally {
+          setActionInsightsLoading(false);
+        }
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Could not load route result.";
       setSendError(msg);
@@ -189,6 +245,28 @@ export function ChatPanel() {
 
   const warehouseUsed = routeProblem !== null ? countPins("warehouse") : 0;
   const deliveryUsed = routeProblem !== null ? countPins("delivery") : 0;
+
+  const messageBubbles = (
+    <>
+      {messages.map((m) => (
+        <div
+          key={m.id}
+          className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}
+        >
+          <div
+            className={`max-w-[85%] rounded-2xl px-4 py-3 text-sm leading-relaxed sm:max-w-[75%] ${
+              m.role === "user"
+                ? "rounded-br-md bg-gradient-to-br from-brand-600 to-emerald-700 text-white shadow-md whitespace-pre-wrap"
+                : "rounded-bl-md border border-white/10 bg-slate-800/90 text-slate-200 whitespace-pre-wrap"
+            }`}
+          >
+            {m.text}
+          </div>
+        </div>
+      ))}
+      <div ref={bottomRef} />
+    </>
+  );
 
   return (
     <div className="flex min-h-dvh flex-col bg-gradient-to-b from-slate-950 via-slate-900 to-slate-950 text-slate-100">
@@ -208,23 +286,7 @@ export function ChatPanel() {
             <section className="pb-4" aria-label="Delivery description">
               <div className="flex max-h-[min(50vh,480px)] min-h-0 flex-col overflow-hidden rounded-2xl border border-white/10 bg-slate-900/50 shadow-xl">
                 <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 py-6 sm:px-6">
-                  {messages.map((m) => (
-                    <div
-                      key={m.id}
-                      className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}
-                    >
-                      <div
-                        className={`max-w-[85%] rounded-2xl px-4 py-3 text-sm leading-relaxed sm:max-w-[75%] ${
-                          m.role === "user"
-                            ? "rounded-br-md bg-gradient-to-br from-brand-600 to-emerald-700 text-white shadow-md whitespace-pre-wrap"
-                            : "rounded-bl-md border border-white/10 bg-slate-800/90 text-slate-200 whitespace-pre-wrap"
-                        }`}
-                      >
-                        {m.text}
-                      </div>
-                    </div>
-                  ))}
-                  <div ref={bottomRef} />
+                  {messageBubbles}
                 </div>
 
                 <form
@@ -238,7 +300,7 @@ export function ChatPanel() {
                         setDraft(e.target.value);
                         setChatError(null);
                       }}
-                      placeholder="Describe warehouses, addresses, cars, packages…"
+                      placeholder="Describe warehouses, addresses, and cars…"
                       rows={3}
                       disabled={chatLoading}
                       className="min-h-[88px] w-full resize-y rounded-xl border border-white/10 bg-slate-900/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-brand-500/40 disabled:opacity-60"
@@ -264,7 +326,24 @@ export function ChatPanel() {
           )}
 
           {phase === "map" && routeProblem !== null && (
-            <>
+            <div className="flex min-h-0 flex-1 flex-col gap-6 lg:flex-row lg:items-start">
+              {optimalRoute === null && (
+                <aside
+                  className="flex w-full shrink-0 flex-col overflow-hidden rounded-2xl border border-white/10 bg-slate-900/50 lg:sticky lg:top-6 lg:max-w-[22rem]"
+                  aria-label="Conversation"
+                >
+                  <div className="border-b border-white/10 px-4 py-2 text-xs font-medium uppercase tracking-wide text-slate-500">
+                    Conversation
+                  </div>
+                  <div className="max-h-[min(42vh,400px)] min-h-0 space-y-4 overflow-y-auto px-4 py-4">
+                    {messageBubbles}
+                  </div>
+                  <p className="border-t border-white/10 px-4 py-2 text-xs text-slate-500">
+                    Read-only while you edit the map and routes.
+                  </p>
+                </aside>
+              )}
+              <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-4">
               <section className="flex min-h-0 flex-1 flex-col gap-4 pb-2" aria-label="Map placement">
                 <div className="flex flex-wrap items-baseline justify-between gap-2">
                   <div>
@@ -272,8 +351,7 @@ export function ChatPanel() {
                     <p className="mt-1 text-sm text-slate-400">
                       Set vehicles per warehouse and demand per delivery stop. Each car has capacity{" "}
                       <span className="font-medium text-slate-200">{VEHICLE_CAPACITY_TEST}</span> for
-                      testing. Extracted package total:{" "}
-                      <span className="font-medium text-slate-200">{routeProblem.packages}</span>.
+                      testing.
                     </p>
                   </div>
                   <p className="text-xs text-slate-500">
@@ -344,7 +422,14 @@ export function ChatPanel() {
                   }}
                 />
 
-                {optimalRoute !== null && <RouteAnalysisReport plan={optimalRoute} />}
+                {optimalRoute !== null && (
+                  <RouteAnalysisReport
+                    plan={optimalRoute}
+                    actionInsights={actionInsights}
+                    actionInsightsLoading={actionInsightsLoading}
+                    actionInsightsError={actionInsightsError}
+                  />
+                )}
 
                 {sendLoading && (
                   <div
@@ -546,6 +631,9 @@ export function ChatPanel() {
                       type="button"
                       onClick={() => {
                         setOptimalRoute(null);
+                        insightsFetchedForJobIdRef.current = null;
+                        setActionInsights(null);
+                        setActionInsightsError(null);
                         setSelectedPinId(null);
                       }}
                       className="rounded-xl border border-white/15 bg-slate-800/90 px-5 py-3 text-sm font-medium text-slate-200 transition hover:bg-slate-700/90"
@@ -571,7 +659,8 @@ export function ChatPanel() {
                   </button>
                 </div>
               </div>
-            </>
+              </div>
+            </div>
           )}
         </div>
       </div>

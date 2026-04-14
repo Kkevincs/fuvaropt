@@ -33,14 +33,4 @@ public static class RouteProblemBuilder
 
         return new RouteProblemResponse(vehicleCount, addressCount, warehouseCount, packageCount);
     }
-
-    public static RouteProblemResponse FromRequest(RouteProblemRequest request)
-    {
-        ArgumentNullException.ThrowIfNull(request);
-        return FromCounts(
-            request.VehicleCount,
-            request.AddressCount,
-            request.WarehouseCount,
-            request.Packages);
-    }
 }

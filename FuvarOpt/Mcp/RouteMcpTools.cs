@@ -25,9 +25,9 @@ public sealed class RouteMcpTools
     }
 
     [McpServerTool, Description(
-        "Extract route problem counts (VehicleCount, AddressCount, WarehouseCount, Packages) from the user's free-text message using Google Gemini.")]
+        "Extract route problem counts (VehicleCount, AddressCount, WarehouseCount) from the user's free-text message using Google Gemini. Does not extract package totals.")]
     public async Task<string> ExtractRouteProblemFromMessage(
-        [Description("Natural language describing vehicles, addresses, warehouses, packages, or routing needs.")]
+        [Description("Natural language describing vehicles, addresses, and warehouses for routing.")]
         string message,
         CancellationToken cancellationToken)
     {
