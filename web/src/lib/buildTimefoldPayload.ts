@@ -50,11 +50,14 @@ export type TimefoldApiPayload = {
 const BBOX_PADDING_RATIO = 0.05;
 const BBOX_PADDING_MIN = 0.002;
 
-/** Fixed per-vehicle capacity for testing (solver payload). */
-export const VEHICLE_CAPACITY_TEST = 3;
+/** Default vehicle capacity in the solver payload (packages per car). */
+export const VEHICLE_CAPACITY_TEST = 20;
 
 /** Default service time at a stop (seconds), e.g. 30 minutes. */
 export const DEFAULT_SERVICE_DURATION_SECONDS = 1800;
+
+/** Planning horizon length: main window, vehicle shift, and each visit min/max are all this wide. */
+export const PLANNING_WINDOW_HOURS = 10;
 
 function asTuple(lat: number, lng: number): LatLngTuple {
   return [lat, lng];
@@ -66,23 +69,16 @@ function toLocalIsoNoOffset(d: Date): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
-function datePart(d: Date): string {
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+function addHours(start: Date, hours: number): Date {
+  const d = new Date(start);
+  d.setTime(d.getTime() + hours * 60 * 60 * 1000);
+  return d;
 }
 
 /** Planning window start: today 07:30 (same idea as demo). */
 function planningStartToday(): Date {
   const d = new Date();
   d.setHours(7, 30, 0, 0);
-  return d;
-}
-
-/** End of horizon: next calendar day 00:00 (demo-style). */
-function planningEndNextMidnight(): Date {
-  const d = new Date();
-  d.setDate(d.getDate() + 1);
-  d.setHours(0, 0, 0, 0);
   return d;
 }
 
@@ -116,10 +112,9 @@ export function buildTimefoldApiPayload(
   maxLng += padLng;
 
   const planStart = planningStartToday();
-  const planEnd = planningEndNextMidnight();
+  const planEnd = addHours(planStart, PLANNING_WINDOW_HOURS);
   const startIso = toLocalIsoNoOffset(planStart);
   const endIso = toLocalIsoNoOffset(planEnd);
-  const dayStr = datePart(planStart);
 
   const warehouses = pins.filter((p) => p.kind === "warehouse");
   const totalVehicles = warehouses.reduce((s, w) => s + (w.vehicleCount ?? 0), 0);
@@ -141,7 +136,7 @@ export function buildTimefoldApiPayload(
         departureTime: startIso,
         visits: [],
         totalDrivingTimeSeconds: 0,
-        arrivalTime: startIso,
+        arrivalTime: endIso,
         totalDemand: 0,
       });
     }
@@ -151,14 +146,13 @@ export function buildTimefoldApiPayload(
 
   const visits: TimefoldVisitPayload[] = deliveries.map((p, i) => {
     const demand = Math.max(0, Math.min(999, Math.floor(p.demand ?? 0)));
-    const morning = i % 2 === 0;
     return {
       id: String(i + 1),
       name: `Delivery ${i + 1}`,
       location: asTuple(p.lat, p.lng),
       demand,
-      minStartTime: morning ? `${dayStr}T08:00:00` : `${dayStr}T13:00:00`,
-      maxEndTime: morning ? `${dayStr}T12:00:00` : `${dayStr}T18:00:00`,
+      minStartTime: startIso,
+      maxEndTime: endIso,
       serviceDuration: DEFAULT_SERVICE_DURATION_SECONDS,
       vehicle: null,
       previousVisit: null,

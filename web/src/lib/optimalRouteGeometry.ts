@@ -26,6 +26,16 @@ export function colorForVehicleId(plan: OptimalRoutePlan, vehicleId: string): st
   return vehicleColorForIndex(vehicleIndexById(plan, vehicleId));
 }
 
+/** When per-visit `vehicle` is missing, infer from `vehicles[].visits` lists. */
+export function vehicleIdForVisit(plan: OptimalRoutePlan, visitId: string): string | null {
+  for (const v of plan.vehicles) {
+    if (v.visits.includes(visitId)) {
+      return v.id;
+    }
+  }
+  return null;
+}
+
 export function buildVisitPositionLookup(
   plan: OptimalRoutePlan,
 ): Map<string, { lat: number; lng: number }> {

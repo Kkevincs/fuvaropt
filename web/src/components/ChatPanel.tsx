@@ -19,7 +19,9 @@ import {
   serializeTimefoldPayload,
 } from "../lib/buildTimefoldPayload";
 import {
+  DEMO_LIMIT_MESSAGE,
   buildMissingDetailsPrompt,
+  exceedsDemoLimits,
   getMissingRouteFields,
   isRouteProblemComplete,
 } from "../lib/routeProblemChat";
@@ -35,7 +37,34 @@ type ChatMessage = {
 };
 
 const introText =
-  "Tell me about the deliveries. Mention how many warehouses, delivery addresses, and vehicles you need. If you skip a number, I will ask until we have all three.";
+  "Tell me about the deliveries. Mention how many warehouses, delivery addresses, and vehicles you need. " +
+  "This demo supports at most 4 warehouses, 8 vehicles, and 20 addresses. " +
+  "If you skip a number, I will ask until we have all three.";
+
+/** Max time for warm-up GET + wait + final GET + insights after POST. */
+const ROUTE_LOAD_TIMEOUT_MS = 120_000;
+
+/** Wait between first GET (after POST) and final GET so the solver can finish. */
+const SOLVER_WAIT_MS = 30_000;
+
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new DOMException("Aborted", "AbortError"));
+      return;
+    }
+    const id = window.setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      window.clearTimeout(id);
+      signal.removeEventListener("abort", onAbort);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+    signal.addEventListener("abort", onAbort);
+  });
+}
 
 /** Only warehouse and delivery pins are quota-driven from the API. */
 const pinKinds: MapPinKind[] = ["warehouse", "delivery"];
@@ -60,8 +89,6 @@ export function ChatPanel() {
 
   const [sendError, setSendError] = useState<string | null>(null);
   const [sendLoading, setSendLoading] = useState(false);
-  /** Set after POST /route-plans succeeds; used only for GET (no second POST). */
-  const [routePlanJobId, setRoutePlanJobId] = useState<string | null>(null);
   const [fetchResultLoading, setFetchResultLoading] = useState(false);
   const [optimalRoute, setOptimalRoute] = useState<OptimalRoutePlan | null>(null);
   /** Top 3 Gemini post-optimization suggestions (shown under Route analysis, not in chat). */
@@ -103,6 +130,13 @@ export function ChatPanel() {
         setMessages((prev) => [
           ...prev,
           { id: crypto.randomUUID(), role: "assistant", text: followUp },
+        ]);
+        return;
+      }
+      if (exceedsDemoLimits(res)) {
+        setMessages((prev) => [
+          ...prev,
+          { id: crypto.randomUUID(), role: "assistant", text: DEMO_LIMIT_MESSAGE },
         ]);
         return;
       }
@@ -175,43 +209,18 @@ export function ChatPanel() {
     });
   }
 
-  async function handleSendTimefold() {
-    if (routeProblem === null) {
-      return;
-    }
-    setSendError(null);
-    setSendLoading(true);
-    try {
-      const payload = buildTimefoldApiPayload(routeProblem, mapPins);
-      const raw = serializeTimefoldPayload(payload);
-      console.log(
-        "[Timefold] final JSON (same bytes as POST body; copy for Postman)\n" +
-          JSON.stringify(JSON.parse(raw), null, 2),
-      );
-      const jobId = await postRoutePlanJob(payload);
-      setRoutePlanJobId(jobId);
-      insightsFetchedForJobIdRef.current = null;
-      setOptimalRoute(null);
-      setActionInsights(null);
-      setActionInsightsError(null);
-      setSelectedPinId(null);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : "Submit failed.";
-      setSendError(msg);
-    } finally {
-      setSendLoading(false);
-    }
-  }
-
-  async function handleLoadOptimizedRoute() {
-    if (routePlanJobId === null || routePlanJobId === "") {
-      return;
-    }
-    const jobId = routePlanJobId;
-    setSendError(null);
+  async function runOptimizedRoutePipeline(jobId: string) {
     setFetchResultLoading(true);
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), ROUTE_LOAD_TIMEOUT_MS);
     try {
-      const plan = await fetchRoutePlanResult(jobId);
+      try {
+        await fetchRoutePlanResult(jobId, { signal: controller.signal });
+      } catch {
+        /* First GET may 404 or return NOT_SOLVING — warm-up only; final GET runs after wait. */
+      }
+      await sleep(SOLVER_WAIT_MS, controller.signal);
+      const plan = await fetchRoutePlanResult(jobId, { signal: controller.signal });
       setOptimalRoute(plan);
       setSelectedPinId(null);
 
@@ -236,11 +245,49 @@ export function ChatPanel() {
         }
       }
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Could not load route result.";
-      setSendError(msg);
+      if (err instanceof Error && err.name === "AbortError") {
+        setSendError(
+          `Optimizing the route timed out after ${ROUTE_LOAD_TIMEOUT_MS / 1000}s. The solver may still be running—try sending again in a moment.`,
+        );
+      } else {
+        const msg = err instanceof Error ? err.message : "Could not load route result.";
+        setSendError(msg);
+      }
     } finally {
+      window.clearTimeout(timeoutId);
       setFetchResultLoading(false);
     }
+  }
+
+  async function handleSendTimefold() {
+    if (routeProblem === null) {
+      return;
+    }
+    setSendError(null);
+    setSendLoading(true);
+    let jobId: string;
+    try {
+      const payload = buildTimefoldApiPayload(routeProblem, mapPins);
+      const raw = serializeTimefoldPayload(payload);
+      console.log(
+        "[Timefold] final JSON (same bytes as POST body; copy for Postman)\n" +
+          JSON.stringify(JSON.parse(raw), null, 2),
+      );
+      jobId = await postRoutePlanJob(payload);
+      insightsFetchedForJobIdRef.current = null;
+      setOptimalRoute(null);
+      setActionInsights(null);
+      setActionInsightsError(null);
+      setSelectedPinId(null);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Submit failed.";
+      setSendError(msg);
+      return;
+    } finally {
+      setSendLoading(false);
+    }
+
+    await runOptimizedRoutePipeline(jobId);
   }
 
   const warehouseUsed = routeProblem !== null ? countPins("warehouse") : 0;
@@ -269,7 +316,26 @@ export function ChatPanel() {
   );
 
   return (
-    <div className="flex min-h-dvh flex-col bg-gradient-to-b from-slate-950 via-slate-900 to-slate-950 text-slate-100">
+    <div className="relative flex min-h-dvh flex-col bg-gradient-to-b from-slate-950 via-slate-900 to-slate-950 text-slate-100">
+      {fetchResultLoading && (
+        <div
+          className="fixed inset-0 z-[100] flex flex-col items-center justify-center gap-5 bg-slate-950/85 backdrop-blur-sm"
+          role="alertdialog"
+          aria-busy="true"
+          aria-live="polite"
+          aria-label="Optimizing route"
+        >
+          <div
+            className="h-14 w-14 animate-spin rounded-full border-4 border-brand-500/25 border-t-brand-400"
+            aria-hidden
+          />
+          <p className="text-lg font-semibold tracking-tight text-white">Optimizing route</p>
+          <p className="max-w-sm px-6 text-center text-sm text-slate-400">
+            Checking job status, waiting {SOLVER_WAIT_MS / 1000} seconds for the solver, then loading the
+            final route. The map stays hidden until then.
+          </p>
+        </div>
+      )}
       <header className="flex shrink-0 items-center gap-3 border-b border-white/10 px-4 py-3 sm:px-6">
         <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-gradient-to-br from-brand-400 to-emerald-700 text-sm font-bold text-slate-950">
           F
@@ -378,9 +444,10 @@ export function ChatPanel() {
                           <button
                             key={kind}
                             type="button"
+                            disabled={fetchResultLoading}
                             onClick={() => setActivePinKind(kind)}
                             title={atCap ? "At maximum for this type" : undefined}
-                            className={`inline-flex items-center gap-2 rounded-xl border px-3 py-2 text-sm font-medium transition ${
+                            className={`inline-flex items-center gap-2 rounded-xl border px-3 py-2 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-40 ${
                               active
                                 ? "border-white/30 bg-white/10 text-white ring-2 ring-brand-500/50"
                                 : "border-white/10 bg-slate-900/80 text-slate-300 hover:bg-slate-800/80"
@@ -406,21 +473,34 @@ export function ChatPanel() {
                       <p className="mt-1 font-mono text-xs text-emerald-200/90">{optimalRoute.score}</p>
                     )}
                     <p className="mt-2 text-xs text-emerald-200/80">
-                      Clear the result below to edit pins and send again.
+                      Clear the route result below to edit pins. You can submit a new job after clearing.
                     </p>
                   </div>
                 )}
 
-                <RouteMap
-                  pins={mapPins}
-                  onAddPin={handleAddPin}
-                  solution={optimalRoute}
-                  onPinClick={(pin) => {
-                    if (optimalRoute === null) {
-                      setSelectedPinId(pin.id);
-                    }
-                  }}
-                />
+                {fetchResultLoading ? (
+                  <div
+                    className="flex h-[min(55vh,520px)] min-h-[280px] w-full flex-col items-center justify-center gap-3 rounded-2xl border border-white/10 bg-slate-900/80 ring-1 ring-white/5"
+                    role="status"
+                    aria-live="polite"
+                  >
+                    <p className="text-sm font-medium text-slate-300">Map hidden during optimization</p>
+                    <p className="max-w-xs px-4 text-center text-xs text-slate-500">
+                      The route appears here after the final fetch completes.
+                    </p>
+                  </div>
+                ) : (
+                  <RouteMap
+                    pins={mapPins}
+                    onAddPin={handleAddPin}
+                    solution={optimalRoute}
+                    onPinClick={(pin) => {
+                      if (optimalRoute === null) {
+                        setSelectedPinId(pin.id);
+                      }
+                    }}
+                  />
+                )}
 
                 {optimalRoute !== null && (
                   <RouteAnalysisReport
@@ -442,22 +522,6 @@ export function ChatPanel() {
                       aria-hidden
                     />
                     <p className="font-medium text-white">Submitting job…</p>
-                  </div>
-                )}
-
-                {routePlanJobId !== null && !sendLoading && (
-                  <div
-                    className="rounded-xl border border-slate-600/50 bg-slate-900/70 px-4 py-3 text-sm text-slate-200"
-                    role="status"
-                  >
-                    <p className="font-medium text-white">Job queued</p>
-                    <p className="mt-1 font-mono text-xs text-slate-400 break-all">{routePlanJobId}</p>
-                    <p className="mt-2 text-xs leading-relaxed text-slate-400">
-                      The solver may need several seconds (often ~7s or more). When it is ready, press{" "}
-                      <span className="font-medium text-slate-300">Load optimized route</span> to fetch the
-                      result (GET only—no second POST). Use the same button again to refresh the map from
-                      this job id.
-                    </p>
                   </div>
                 )}
 
@@ -641,22 +705,16 @@ export function ChatPanel() {
                       Clear route result
                     </button>
                   )}
-                  <button
-                    type="button"
-                    disabled={routePlanJobId === null || fetchResultLoading || sendLoading}
-                    onClick={() => void handleLoadOptimizedRoute()}
-                    className="rounded-xl border border-brand-500/40 bg-brand-950/60 px-5 py-3 text-sm font-semibold text-brand-100 transition hover:bg-brand-900/70 disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    {fetchResultLoading ? "Loading…" : "Load optimized route"}
-                  </button>
-                  <button
-                    type="button"
-                    disabled={sendLoading}
-                    onClick={() => void handleSendTimefold()}
-                    className="rounded-xl bg-brand-500 px-8 py-3 text-sm font-semibold text-slate-950 transition hover:bg-brand-400 disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    {sendLoading ? "Sending…" : "Send"}
-                  </button>
+                  {optimalRoute === null && (
+                    <button
+                      type="button"
+                      disabled={sendLoading || fetchResultLoading}
+                      onClick={() => void handleSendTimefold()}
+                      className="rounded-xl bg-brand-500 px-8 py-3 text-sm font-semibold text-slate-950 transition hover:bg-brand-400 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {sendLoading ? "Sending…" : "Send"}
+                    </button>
+                  )}
                 </div>
               </div>
               </div>

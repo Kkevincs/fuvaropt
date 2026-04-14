@@ -2,7 +2,11 @@ import L from "leaflet";
 import { useEffect, useMemo } from "react";
 import { MapContainer, Marker, Polyline, TileLayer, useMap, useMapEvents } from "react-leaflet";
 import type { OptimalRoutePlan } from "../types/optimalRoutePlan";
-import { buildVehicleRoutePaths, colorForVehicleId } from "../lib/optimalRouteGeometry";
+import {
+  buildVehicleRoutePaths,
+  colorForVehicleId,
+  vehicleIdForVisit,
+} from "../lib/optimalRouteGeometry";
 
 export type MapPinKind = "warehouse" | "delivery" | "start" | "end";
 
@@ -195,9 +199,12 @@ export function RouteMap({ pins, onAddPin, onPinClick, solution = null }: RouteM
             solution !== null &&
             solution.visits.map((visit) => {
               const [lat, lng] = visit.location;
-              const vid = visit.vehicle;
+              const vid =
+                typeof visit.vehicle === "string" && visit.vehicle.length > 0
+                  ? visit.vehicle
+                  : vehicleIdForVisit(solution, visit.id);
               const color =
-                typeof vid === "string" && vid.length > 0
+                vid !== null && vid.length > 0
                   ? colorForVehicleId(solution, vid)
                   : "#64748b";
               return (

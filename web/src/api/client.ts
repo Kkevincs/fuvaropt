@@ -59,9 +59,12 @@ export function extractJobIdFromPostResponse(data: unknown): string | undefined 
   return undefined;
 }
 
-export async function fetchRoutePlanResult(jobId: string): Promise<OptimalRoutePlan> {
+export async function fetchRoutePlanResult(
+  jobId: string,
+  init?: { signal?: AbortSignal },
+): Promise<OptimalRoutePlan> {
   const url = getRoutePlanJobUrl(jobId);
-  const res = await fetch(url, { method: "GET" });
+  const res = await fetch(url, { method: "GET", signal: init?.signal });
   const text = await res.text();
   let data: unknown = text;
   try {

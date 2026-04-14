@@ -49,32 +49,96 @@ function isLatLngTuple(v: unknown): v is LatLngTuple {
   return typeof v[0] === "number" && typeof v[1] === "number";
 }
 
+function pickVisitId(v: unknown): string | null {
+  if (typeof v === "string" && v.length > 0) {
+    return v;
+  }
+  if (typeof v === "number" && Number.isFinite(v)) {
+    return String(v);
+  }
+  return null;
+}
+
+/** API may use camelCase or PascalCase; some fields use numeric ids in JSON. */
 function parseVisit(raw: unknown): OptimalRouteVisit | null {
   if (raw === null || typeof raw !== "object") {
     return null;
   }
   const o = raw as Record<string, unknown>;
-  const id = o.id;
-  const name = o.name;
-  const location = o.location;
-  const demand = o.demand;
-  if (typeof id !== "string" || typeof name !== "string" || !isLatLngTuple(location)) {
+  const idRaw = o.id ?? o.Id;
+  const nameRaw = o.name ?? o.Name;
+  const location = o.location ?? o.Location;
+  const demand = o.demand ?? o.Demand;
+  const id = pickVisitId(idRaw);
+  const name = typeof nameRaw === "string" ? nameRaw : nameRaw != null ? String(nameRaw) : "";
+  if (id === null || name === "" || !isLatLngTuple(location)) {
     return null;
+  }
+  const vehicleRaw = o.vehicle ?? o.Vehicle;
+  let vehicle: string | null | undefined;
+  if (vehicleRaw === null) {
+    vehicle = null;
+  } else if (typeof vehicleRaw === "string") {
+    vehicle = vehicleRaw;
+  } else if (typeof vehicleRaw === "number" && Number.isFinite(vehicleRaw)) {
+    vehicle = String(vehicleRaw);
+  } else {
+    vehicle = undefined;
+  }
+  const prevRaw = o.previousVisit ?? o.PreviousVisit;
+  let previousVisit: string | null | undefined;
+  if (prevRaw === null) {
+    previousVisit = null;
+  } else if (typeof prevRaw === "string") {
+    previousVisit = prevRaw;
+  } else if (typeof prevRaw === "number" && Number.isFinite(prevRaw)) {
+    previousVisit = String(prevRaw);
+  } else {
+    previousVisit = undefined;
   }
   return {
     id,
     name,
     location,
     demand: typeof demand === "number" ? demand : Number(demand) || 0,
-    minStartTime: typeof o.minStartTime === "string" ? o.minStartTime : undefined,
-    maxEndTime: typeof o.maxEndTime === "string" ? o.maxEndTime : undefined,
-    serviceDuration: typeof o.serviceDuration === "number" ? o.serviceDuration : undefined,
-    vehicle: typeof o.vehicle === "string" ? o.vehicle : o.vehicle === null ? null : undefined,
-    previousVisit:
-      typeof o.previousVisit === "string" ? o.previousVisit : o.previousVisit === null ? null : undefined,
-    arrivalTime: typeof o.arrivalTime === "string" ? o.arrivalTime : undefined,
-    departureTime: typeof o.departureTime === "string" ? o.departureTime : undefined,
-    startServiceTime: typeof o.startServiceTime === "string" ? o.startServiceTime : undefined,
+    minStartTime:
+      typeof o.minStartTime === "string"
+        ? o.minStartTime
+        : typeof o.MinStartTime === "string"
+          ? o.MinStartTime
+          : undefined,
+    maxEndTime:
+      typeof o.maxEndTime === "string"
+        ? o.maxEndTime
+        : typeof o.MaxEndTime === "string"
+          ? o.MaxEndTime
+          : undefined,
+    serviceDuration:
+      typeof o.serviceDuration === "number"
+        ? o.serviceDuration
+        : typeof o.ServiceDuration === "number"
+          ? o.ServiceDuration
+          : undefined,
+    vehicle,
+    previousVisit,
+    arrivalTime:
+      typeof o.arrivalTime === "string"
+        ? o.arrivalTime
+        : typeof o.ArrivalTime === "string"
+          ? o.ArrivalTime
+          : undefined,
+    departureTime:
+      typeof o.departureTime === "string"
+        ? o.departureTime
+        : typeof o.DepartureTime === "string"
+          ? o.DepartureTime
+          : undefined,
+    startServiceTime:
+      typeof o.startServiceTime === "string"
+        ? o.startServiceTime
+        : typeof o.StartServiceTime === "string"
+          ? o.StartServiceTime
+          : undefined,
     drivingTimeSecondsFromPreviousStandstill:
       typeof o.drivingTimeSecondsFromPreviousStandstill === "number"
         ? o.drivingTimeSecondsFromPreviousStandstill
@@ -87,16 +151,17 @@ function parseVehicle(raw: unknown): OptimalRouteVehicle | null {
     return null;
   }
   const o = raw as Record<string, unknown>;
-  const id = o.id;
-  const homeLocation = o.homeLocation;
-  if (typeof id !== "string" || !isLatLngTuple(homeLocation)) {
+  const idRaw = o.id ?? o.Id;
+  const id = typeof idRaw === "string" ? idRaw : pickVisitId(idRaw);
+  const homeLocation = o.homeLocation ?? o.HomeLocation;
+  if (id === null || !isLatLngTuple(homeLocation)) {
     return null;
   }
-  const visitsRaw = o.visits;
+  const visitsRaw = o.visits ?? o.Visits;
   const visits: string[] = Array.isArray(visitsRaw)
-    ? visitsRaw.filter((x): x is string => typeof x === "string")
+    ? visitsRaw.map((x) => (typeof x === "string" ? x : typeof x === "number" ? String(x) : "")).filter((x) => x.length > 0)
     : [];
-  const capacity = o.capacity;
+  const capacity = o.capacity ?? o.Capacity;
   return {
     id,
     capacity: typeof capacity === "number" ? capacity : Number(capacity) || 0,
