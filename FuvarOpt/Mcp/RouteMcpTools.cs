@@ -15,6 +15,11 @@ public sealed class RouteMcpTools
         PropertyNamingPolicy = null,
     };
 
+    private static readonly JsonSerializerOptions JsonCamelOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+    };
+
     private readonly GeminiRouteExtractionService _gemini;
     private readonly RouteOptimizationAnalysisService _routeAnalysis;
 
@@ -22,6 +27,18 @@ public sealed class RouteMcpTools
     {
         _gemini = gemini;
         _routeAnalysis = routeAnalysis;
+    }
+
+    [McpServerTool, Description(
+        "Extract employee scheduling data (employees with skills and date preferences, shifts with id/start/end/location/requiredSkill) from the user's free-text message using Google Gemini. "
+        + "Same extraction as POST /api/schedule/from-message. Returns JSON with employees, shifts, and complete.")]
+    public async Task<string> ExtractScheduleFromMessage(
+        [Description("Natural language describing employees, skills, dates, and shifts to schedule.")]
+        string message,
+        CancellationToken cancellationToken)
+    {
+        var result = await _gemini.ExtractScheduleFromMessageAsync(message, cancellationToken).ConfigureAwait(false);
+        return JsonSerializer.Serialize(result, JsonCamelOptions);
     }
 
     [McpServerTool, Description(

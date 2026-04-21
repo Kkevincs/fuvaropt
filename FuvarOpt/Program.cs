@@ -125,6 +125,76 @@ public static class Program
             .Produces(StatusCodes.Status503ServiceUnavailable);
 
         app.MapPost(
+                "/api/schedule/from-message",
+                async (
+                    ScheduleFromMessageRequest? body,
+                    GeminiRouteExtractionService gemini,
+                    CancellationToken cancellationToken) =>
+                {
+                    if (body is null || string.IsNullOrWhiteSpace(body.Message))
+                    {
+                        return Results.BadRequest(new { error = "Message is required." });
+                    }
+
+                    try
+                    {
+                        var result = await gemini
+                            .ExtractScheduleFromMessageAsync(body.Message, cancellationToken)
+                            .ConfigureAwait(false);
+                        return Results.Ok(result);
+                    }
+                    catch (InvalidOperationException ex)
+                    {
+                        return Results.Json(
+                            new { error = ex.Message },
+                            statusCode: StatusCodes.Status503ServiceUnavailable);
+                    }
+                    catch (ArgumentException ex)
+                    {
+                        return Results.BadRequest(new { error = ex.Message });
+                    }
+                })
+            .WithName("CreateScheduleFromMessage")
+            .Produces<ScheduleExtractResponse>(StatusCodes.Status200OK)
+            .Produces(StatusCodes.Status400BadRequest)
+            .Produces(StatusCodes.Status503ServiceUnavailable);
+
+        app.MapPost(
+                "/api/schedule/post-optimization-suggestions",
+                async (
+                    PostScheduleOptimizationSuggestionsRequest? body,
+                    GeminiRouteExtractionService gemini,
+                    CancellationToken cancellationToken) =>
+                {
+                    if (body is null || string.IsNullOrWhiteSpace(body.SolvedScheduleJson))
+                    {
+                        return Results.BadRequest(new { error = "SolvedScheduleJson is required." });
+                    }
+
+                    try
+                    {
+                        var result = await gemini
+                            .GetPostScheduleOptimizationSuggestionsAsync(body.SolvedScheduleJson, cancellationToken)
+                            .ConfigureAwait(false);
+                        return Results.Ok(result);
+                    }
+                    catch (InvalidOperationException ex)
+                    {
+                        return Results.Json(
+                            new { error = ex.Message },
+                            statusCode: StatusCodes.Status503ServiceUnavailable);
+                    }
+                    catch (ArgumentException ex)
+                    {
+                        return Results.BadRequest(new { error = ex.Message });
+                    }
+                })
+            .WithName("PostScheduleOptimizationSuggestions")
+            .Produces<PostOptimizationSuggestionsResponse>(StatusCodes.Status200OK)
+            .Produces(StatusCodes.Status400BadRequest)
+            .Produces(StatusCodes.Status503ServiceUnavailable);
+
+        app.MapPost(
                 "/api/route-problem/post-optimization-suggestions",
                 async (
                     PostOptimizationSuggestionsRequest? body,

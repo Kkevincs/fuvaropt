@@ -9,9 +9,13 @@ import {
 import { RouteAnalysisReport } from "./RouteAnalysisReport";
 import {
   fetchRoutePlanResult,
+  fetchScheduleResult,
   postOptimizationSuggestions,
   postRoutePlanJob,
   postRouteProblemFromMessage,
+  postScheduleFromMessage,
+  postScheduleJob,
+  postScheduleOptimizationSuggestions,
 } from "../api/client";
 import {
   VEHICLE_CAPACITY_TEST,
@@ -27,6 +31,15 @@ import {
 } from "../lib/routeProblemChat";
 import type { OptimalRoutePlan } from "../types/optimalRoutePlan";
 import type { RouteProblemResponse } from "../types/routeProblem";
+import type { SchedulePayload, ScheduleSolveResponse } from "../types/scheduleProblem";
+import { buildSchedulePayload } from "../lib/buildSchedulePayload";
+import {
+  SCHEDULE_DEMO_LIMITS_MESSAGE,
+  buildMissingSchedulePrompt,
+  isScheduleExtractComplete,
+} from "../lib/scheduleProblemChat";
+import { ScheduleTimeline } from "./ScheduleTimeline";
+import { ScheduleInsightsReport } from "./ScheduleInsightsReport";
 
 type ChatRole = "user" | "assistant";
 
@@ -41,11 +54,33 @@ const introText =
   "This demo supports at most 4 warehouses, 8 vehicles, and 20 addresses. " +
   "If you skip a number, I will ask until we have all three.";
 
+const welcomeIntroText =
+  "What problem are you solving today? I can help with:\n\n" +
+  "• Employee scheduling — shifts, skills, availability, and a solved timeline.\n\n" +
+  "• Route optimization — warehouses, delivery stops, vehicles, and a map.\n\n" +
+  "Briefly describe your situation, or say which of the two you need.";
+
+const clarifyProblemTypeText =
+  "I’m not sure which you mean. Are you trying to solve employee scheduling (shifts, people, availability) " +
+  "or route optimization (deliveries, warehouses, vehicles)? " +
+  "Reply with a short phrase—for example “scheduling” or “routes.”";
+
+const scheduleIntroText =
+  "Describe employees and shifts in natural language (names, skills, unavailable or preferred dates, shift times, locations, required skills). " +
+  SCHEDULE_DEMO_LIMITS_MESSAGE +
+  " Your message is sent to the FuvarOpt API, which uses the same Gemini extraction as the MCP tool ExtractScheduleFromMessage. " +
+  "I will ask for anything still missing before you can submit.";
+
 /** Max time for warm-up GET + wait + final GET + insights after POST. */
 const ROUTE_LOAD_TIMEOUT_MS = 120_000;
 
 /** Wait between first GET (after POST) and final GET so the solver can finish. */
 const SOLVER_WAIT_MS = 30_000;
+
+/** Schedule solver: wait before GET result (matches plan). */
+const SCHEDULE_SOLVER_WAIT_MS = 7_000;
+
+type ProblemType = "unset" | "routing" | "scheduling";
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -69,13 +104,53 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
 /** Only warehouse and delivery pins are quota-driven from the API. */
 const pinKinds: MapPinKind[] = ["warehouse", "delivery"];
 
+function classifyProblemIntent(text: string): "routing" | "scheduling" | "ambiguous" {
+  const t = text.toLowerCase();
+  const sched =
+    /\bschedul(ing|e)?\b|\bshift(s)?\b|\bemployee(s)?\b|\bstaff(ing)?\b|\broster\b|\brota\b|\bavailability\b|\btime ?off\b|\bunavailable\b|\b(cover|work)\s+(a\s+)?shift\b|\bnight\s+shift\b|\bweekend\s+work\b|\bteam\s+schedule\b/.test(
+      t,
+    );
+  const route =
+    /\broute(s|ing)?\b|\bdeliver(y|ies|ing)?\b|\bwarehouse(s)?\b|\bvehicle(s)?\b|\btruck(s)?\b|\bvan(s)?\b|\bfleet\b|\bmap\b|\baddress(es)?\b|\bstop(s)?\b|\bgps\b|\btransport(ing)?\b|\bparcel(s)?\b|\bpackage(s)?\b|\bcargo\b/.test(
+      t,
+    );
+
+  if (sched && !route) {
+    return "scheduling";
+  }
+  if (route && !sched) {
+    return "routing";
+  }
+  if (sched && route) {
+    if (/\bemployee\s+schedul|staff\s+shift|shift\s+plan|work\s+schedul\b/i.test(text)) {
+      return "scheduling";
+    }
+    if (/\bvehicle\s+rout|delivery\s+rout|route\s+optim|optimize\s+rout|multi[\s-]*stop\b/i.test(text)) {
+      return "routing";
+    }
+    return "ambiguous";
+  }
+  const w = t.trim();
+  if (/^(scheduling|schedule|shifts|employees|staff|roster)$/i.test(w)) {
+    return "scheduling";
+  }
+  if (/^(routing|routes?|deliveries|delivery|vehicles|map)$/i.test(w)) {
+    return "routing";
+  }
+  return "ambiguous";
+}
+
+/** Clears both domains so entering routing or scheduling from the welcome step starts clean. */
+function createInitialWelcomeMessage(): ChatMessage {
+  return { id: crypto.randomUUID(), role: "assistant", text: welcomeIntroText };
+}
+
 export function ChatPanel() {
+  const [problemType, setProblemType] = useState<ProblemType>("unset");
   const [phase, setPhase] = useState<"chat" | "map">("chat");
   const [routeProblem, setRouteProblem] = useState<RouteProblemResponse | null>(null);
 
-  const [messages, setMessages] = useState<ChatMessage[]>([
-    { id: "q", role: "assistant", text: introText },
-  ]);
+  const [messages, setMessages] = useState<ChatMessage[]>(() => [createInitialWelcomeMessage()]);
   const [draft, setDraft] = useState("");
   const [chatError, setChatError] = useState<string | null>(null);
   const [chatLoading, setChatLoading] = useState(false);
@@ -98,6 +173,22 @@ export function ChatPanel() {
   /** Skip duplicate Gemini calls when reloading the same job id. */
   const insightsFetchedForJobIdRef = useRef<string | null>(null);
 
+  /** Combined user lines for schedule extraction (same pattern as routing). */
+  const [extractionScheduleParts, setExtractionScheduleParts] = useState<string[]>([]);
+  const [schedulePayloadDraft, setSchedulePayloadDraft] = useState<SchedulePayload | null>(null);
+  const [scheduleResult, setScheduleResult] = useState<ScheduleSolveResponse | null>(null);
+  const [scheduleJobId, setScheduleJobId] = useState<string | null>(null);
+  const [scheduleOptimizing, setScheduleOptimizing] = useState(false);
+  const [scheduleSolveError, setScheduleSolveError] = useState<string | null>(null);
+  const [schedulingChatLoading, setSchedulingChatLoading] = useState(false);
+  const [scheduleRetryLoading, setScheduleRetryLoading] = useState(false);
+  /** Top Gemini post-optimization suggestions for the solved schedule (under timeline). */
+  const [scheduleActionInsights, setScheduleActionInsights] = useState<string[] | null>(null);
+  const [scheduleActionInsightsLoading, setScheduleActionInsightsLoading] = useState(false);
+  const [scheduleActionInsightsError, setScheduleActionInsightsError] = useState<string | null>(null);
+  /** Skip duplicate Gemini calls when reloading the same schedule job id. */
+  const scheduleInsightsFetchedForJobIdRef = useRef<string | null>(null);
+
   const selectedPin = useMemo(
     () => (selectedPinId === null ? null : mapPins.find((p) => p.id === selectedPinId) ?? null),
     [mapPins, selectedPinId],
@@ -106,6 +197,209 @@ export function ChatPanel() {
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  function replaceStateForChosenMode(mode: "routing" | "scheduling") {
+    setProblemType(mode);
+    setPhase("chat");
+    setDraft("");
+    setExtractionMessageParts([]);
+    setRouteProblem(null);
+    setChatError(null);
+    setMapPins([]);
+    setSelectedPinId(null);
+    setOptimalRoute(null);
+    insightsFetchedForJobIdRef.current = null;
+    setActionInsights(null);
+    setActionInsightsError(null);
+    setSendError(null);
+    setScheduleResult(null);
+    setScheduleJobId(null);
+    setScheduleSolveError(null);
+    setExtractionScheduleParts([]);
+    setSchedulePayloadDraft(null);
+    scheduleInsightsFetchedForJobIdRef.current = null;
+    setScheduleActionInsights(null);
+    setScheduleActionInsightsError(null);
+  }
+
+  function handleWelcomeSubmit(e: FormEvent) {
+    e.preventDefault();
+    const text = draft.trim();
+    if (!text) {
+      return;
+    }
+
+    const intent = classifyProblemIntent(text);
+    const userMsg: ChatMessage = { id: crypto.randomUUID(), role: "user", text };
+
+    if (intent === "ambiguous") {
+      setDraft("");
+      setMessages((prev) => [
+        ...prev,
+        userMsg,
+        { id: crypto.randomUUID(), role: "assistant", text: clarifyProblemTypeText },
+      ]);
+      return;
+    }
+
+    const followUp = intent === "routing" ? introText : scheduleIntroText;
+    setDraft("");
+    replaceStateForChosenMode(intent);
+    setMessages((prev) => [
+      ...prev,
+      userMsg,
+      { id: crypto.randomUUID(), role: "assistant", text: followUp },
+    ]);
+  }
+
+  async function handleSchedulingSubmit(e: FormEvent) {
+    e.preventDefault();
+    const text = draft.trim();
+    if (!text || schedulingChatLoading || scheduleOptimizing) {
+      return;
+    }
+
+    setSchedulingChatLoading(true);
+    setDraft("");
+    setMessages((prev) => [...prev, { id: crypto.randomUUID(), role: "user", text }]);
+
+    const combinedMessage = [...extractionScheduleParts, text].join("\n\n");
+
+    try {
+      const res = await postScheduleFromMessage({ message: combinedMessage });
+      if (!isScheduleExtractComplete(res)) {
+        setSchedulePayloadDraft(null);
+        setExtractionScheduleParts((prev) => [...prev, text]);
+        const followUp = buildMissingSchedulePrompt(res);
+        setMessages((prev) => [
+          ...prev,
+          { id: crypto.randomUUID(), role: "assistant", text: followUp },
+        ]);
+        return;
+      }
+      setExtractionScheduleParts([combinedMessage]);
+      const employees = res.employees.map((e) => ({
+        name: e.name,
+        skills: e.skills ?? [],
+        unavailableDates: e.unavailableDates ?? [],
+        undesiredDates: e.undesiredDates ?? [],
+        desiredDates: e.desiredDates ?? [],
+      }));
+      const payload = buildSchedulePayload(employees, res.shifts);
+      setSchedulePayloadDraft(payload);
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: crypto.randomUUID(),
+          role: "assistant",
+          text: "Schedule extracted. Submitting to the solver…",
+        },
+      ]);
+      await handleSubmitSchedule(payload);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Something went wrong.";
+      setMessages((prev) => [
+        ...prev,
+        { id: crypto.randomUUID(), role: "assistant", text: msg },
+      ]);
+    } finally {
+      setSchedulingChatLoading(false);
+    }
+  }
+
+  async function loadSchedulePostOptimizationInsights(jobId: string, solved: ScheduleSolveResponse) {
+    if (scheduleInsightsFetchedForJobIdRef.current === jobId) {
+      return;
+    }
+    setScheduleActionInsights(null);
+    setScheduleActionInsightsError(null);
+    setScheduleActionInsightsLoading(true);
+    try {
+      const ins = await postScheduleOptimizationSuggestions(JSON.stringify(solved));
+      scheduleInsightsFetchedForJobIdRef.current = jobId;
+      setScheduleActionInsights(ins.suggestions.slice(0, 3));
+      setScheduleActionInsightsError(null);
+    } catch (err) {
+      setScheduleActionInsights(null);
+      setScheduleActionInsightsError(
+        err instanceof Error
+          ? err.message
+          : "Could not load AI suggestions. Check FuvarOpt and Gemini configuration.",
+      );
+    } finally {
+      setScheduleActionInsightsLoading(false);
+    }
+  }
+
+  async function runScheduleOptimizationPipeline(jobId: string) {
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), ROUTE_LOAD_TIMEOUT_MS);
+    try {
+      await sleep(SCHEDULE_SOLVER_WAIT_MS, controller.signal);
+      const solved = await fetchScheduleResult(jobId, { signal: controller.signal });
+      setScheduleResult(solved);
+      setScheduleSolveError(null);
+      await loadSchedulePostOptimizationInsights(jobId, solved);
+    } catch (err) {
+      if (err instanceof Error && err.name === "AbortError") {
+        setScheduleSolveError(
+          `Fetching the schedule timed out after ${ROUTE_LOAD_TIMEOUT_MS / 1000}s. You can retry below.`,
+        );
+      } else {
+        setScheduleSolveError(err instanceof Error ? err.message : "Could not load schedule result.");
+      }
+    } finally {
+      window.clearTimeout(timeoutId);
+    }
+  }
+
+  /** Pass `payload` when calling right after building it so POST runs without waiting for React state (e.g. auto-submit after extract). */
+  async function handleSubmitSchedule(payloadOverride?: SchedulePayload) {
+    const payload = payloadOverride ?? schedulePayloadDraft;
+    if (payload === null) {
+      setScheduleSolveError("Extract a complete schedule in chat first (the assistant will confirm when ready).");
+      return;
+    }
+    setScheduleSolveError(null);
+    setScheduleOptimizing(true);
+    let jobId: string;
+    try {
+      jobId = await postScheduleJob(payload);
+      scheduleInsightsFetchedForJobIdRef.current = null;
+      setScheduleActionInsights(null);
+      setScheduleActionInsightsError(null);
+      setScheduleJobId(jobId);
+      setScheduleResult(null);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Submit failed.";
+      setScheduleSolveError(msg);
+      setScheduleOptimizing(false);
+      return;
+    }
+
+    try {
+      await runScheduleOptimizationPipeline(jobId);
+    } finally {
+      setScheduleOptimizing(false);
+    }
+  }
+
+  async function handleRetryScheduleFetch() {
+    if (scheduleJobId === null) {
+      return;
+    }
+    setScheduleRetryLoading(true);
+    setScheduleSolveError(null);
+    try {
+      const solved = await fetchScheduleResult(scheduleJobId);
+      setScheduleResult(solved);
+      await loadSchedulePostOptimizationInsights(scheduleJobId, solved);
+    } catch (err) {
+      setScheduleSolveError(err instanceof Error ? err.message : "Could not load schedule result.");
+    } finally {
+      setScheduleRetryLoading(false);
+    }
+  }
 
   async function handleChatSubmit(e: FormEvent) {
     e.preventDefault();
@@ -336,19 +630,182 @@ export function ChatPanel() {
           </p>
         </div>
       )}
+      {scheduleOptimizing && (
+        <div
+          className="fixed inset-0 z-[100] flex flex-col items-center justify-center gap-5 bg-slate-950/85 backdrop-blur-sm"
+          role="alertdialog"
+          aria-busy="true"
+          aria-live="polite"
+          aria-label="Optimizing schedule"
+        >
+          <div
+            className="h-14 w-14 animate-spin rounded-full border-4 border-brand-500/25 border-t-brand-400"
+            aria-hidden
+          />
+          <p className="text-lg font-semibold tracking-tight text-white">Optimizing schedule</p>
+          <p className="max-w-sm px-6 text-center text-sm text-slate-400">
+            Job submitted. Waiting {SCHEDULE_SOLVER_WAIT_MS / 1000} seconds, then loading the solved
+            schedule.
+          </p>
+        </div>
+      )}
       <header className="flex shrink-0 items-center gap-3 border-b border-white/10 px-4 py-3 sm:px-6">
         <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-gradient-to-br from-brand-400 to-emerald-700 text-sm font-bold text-slate-950">
           F
         </span>
         <div>
           <h1 className="text-sm font-semibold text-white">FuvarOpt</h1>
-          <p className="text-xs text-slate-500">Route assistant</p>
+          <p className="text-xs text-slate-500">
+            {problemType === "scheduling"
+              ? "Schedule assistant"
+              : problemType === "routing"
+                ? "Route assistant"
+                : "Getting started"}
+          </p>
         </div>
       </header>
 
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
         <div className="mx-auto flex w-full max-w-6xl flex-col gap-8 px-4 py-6 sm:px-6">
-          {phase === "chat" && (
+          {problemType === "unset" && (
+            <section className="pb-4" aria-label="What problem are you solving">
+              <div className="flex max-h-[min(50vh,480px)] min-h-0 flex-col overflow-hidden rounded-2xl border border-white/10 bg-slate-900/50 shadow-xl">
+                <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 py-6 sm:px-6">
+                  {messageBubbles}
+                </div>
+
+                <form
+                  className="shrink-0 border-t border-white/10 bg-slate-950/60 p-4 sm:p-5"
+                  onSubmit={handleWelcomeSubmit}
+                >
+                  <div className="flex flex-col gap-2">
+                    <textarea
+                      value={draft}
+                      onChange={(e) => setDraft(e.target.value)}
+                      placeholder="Describe your problem, or say scheduling vs routes…"
+                      rows={3}
+                      className="min-h-[88px] w-full resize-y rounded-xl border border-white/10 bg-slate-900/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-brand-500/40"
+                    />
+                    <div className="flex flex-wrap items-center gap-3">
+                      <button
+                        type="submit"
+                        disabled={!draft.trim()}
+                        className="rounded-xl bg-brand-500 px-6 py-3 text-sm font-semibold text-slate-950 transition hover:bg-brand-400 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        Send
+                      </button>
+                    </div>
+                  </div>
+                </form>
+              </div>
+            </section>
+          )}
+
+          {problemType === "scheduling" && (
+            <section className="pb-4" aria-label="Employee scheduling">
+              <div className="flex max-h-[min(50vh,480px)] min-h-0 flex-col overflow-hidden rounded-2xl border border-white/10 bg-slate-900/50 shadow-xl">
+                <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 py-6 sm:px-6">
+                  {messageBubbles}
+                </div>
+
+                <form
+                  className="shrink-0 border-t border-white/10 bg-slate-950/60 p-4 sm:p-5"
+                  onSubmit={handleSchedulingSubmit}
+                >
+                  <div className="flex flex-col gap-2">
+                    <textarea
+                      value={draft}
+                      onChange={(e) => {
+                        setDraft(e.target.value);
+                        setScheduleSolveError(null);
+                      }}
+                      placeholder="Answer the assistant’s questions…"
+                      rows={3}
+                      disabled={schedulingChatLoading || scheduleOptimizing}
+                      className="min-h-[88px] w-full resize-y rounded-xl border border-white/10 bg-slate-900/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-brand-500/40 disabled:opacity-60"
+                    />
+                    <div className="flex flex-wrap items-center gap-3">
+                      <button
+                        type="submit"
+                        disabled={
+                          schedulingChatLoading || scheduleOptimizing || !draft.trim()
+                        }
+                        className="rounded-xl bg-brand-500 px-6 py-3 text-sm font-semibold text-slate-950 transition hover:bg-brand-400 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {schedulingChatLoading ? "Working…" : "Send"}
+                      </button>
+                    </div>
+                  </div>
+                </form>
+              </div>
+
+              <div className="mt-6 flex flex-col gap-4">
+                {scheduleSolveError !== null && (
+                  <div
+                    className="flex flex-col gap-3 rounded-xl border border-rose-500/35 bg-rose-950/40 px-4 py-3 text-sm text-rose-100"
+                    role="alert"
+                  >
+                    <p>{scheduleSolveError}</p>
+                    {scheduleJobId !== null && scheduleResult === null && (
+                      <button
+                        type="button"
+                        disabled={scheduleRetryLoading || scheduleOptimizing}
+                        onClick={() => void handleRetryScheduleFetch()}
+                        className="self-start rounded-lg border border-rose-400/40 bg-rose-900/50 px-4 py-2 text-xs font-semibold text-rose-50 transition hover:bg-rose-800/50 disabled:opacity-50"
+                      >
+                        {scheduleRetryLoading ? "Retrying…" : "Retry fetch"}
+                      </button>
+                    )}
+                  </div>
+                )}
+
+                <div className="flex flex-wrap items-center gap-3">
+                  <button
+                    type="button"
+                    disabled={
+                      schedulePayloadDraft === null || scheduleOptimizing || schedulingChatLoading
+                    }
+                    onClick={() => void handleSubmitSchedule()}
+                    className="rounded-xl bg-emerald-600 px-6 py-3 text-sm font-semibold text-white transition hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    Submit schedule
+                  </button>
+                  {scheduleResult !== null && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setScheduleResult(null);
+                        setScheduleJobId(null);
+                        setScheduleSolveError(null);
+                        scheduleInsightsFetchedForJobIdRef.current = null;
+                        setScheduleActionInsights(null);
+                        setScheduleActionInsightsError(null);
+                      }}
+                      className="rounded-xl border border-white/15 bg-slate-800/90 px-5 py-3 text-sm font-medium text-slate-200 transition hover:bg-slate-700/90"
+                    >
+                      Clear schedule result
+                    </button>
+                  )}
+                </div>
+
+                {scheduleResult !== null && (
+                  <>
+                    <ScheduleTimeline
+                      employees={scheduleResult.employees}
+                      shifts={scheduleResult.shifts}
+                    />
+                    <ScheduleInsightsReport
+                      insights={scheduleActionInsights}
+                      loading={scheduleActionInsightsLoading}
+                      error={scheduleActionInsightsError}
+                    />
+                  </>
+                )}
+              </div>
+            </section>
+          )}
+
+          {problemType === "routing" && phase === "chat" && (
             <section className="pb-4" aria-label="Delivery description">
               <div className="flex max-h-[min(50vh,480px)] min-h-0 flex-col overflow-hidden rounded-2xl border border-white/10 bg-slate-900/50 shadow-xl">
                 <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 py-6 sm:px-6">
@@ -391,7 +848,7 @@ export function ChatPanel() {
             </section>
           )}
 
-          {phase === "map" && routeProblem !== null && (
+          {problemType === "routing" && phase === "map" && routeProblem !== null && (
             <div className="flex min-h-0 flex-1 flex-col gap-6 lg:flex-row lg:items-start">
               {optimalRoute === null && (
                 <aside

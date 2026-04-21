@@ -5,8 +5,12 @@ export default defineConfig({
   plugins: [react()],
   server: {
     proxy: {
-      // Same-origin in dev so the browser does not hit CORS (8080 has no ACAO).
+      // Same-origin in dev so the browser does not hit CORS. Route-plans API on 1010.
       "/route-plans": {
+        target: "http://localhost:1010",
+        changeOrigin: true,
+      },
+      "/schedules": {
         target: "http://localhost:8080",
         changeOrigin: true,
       },
@@ -15,6 +19,10 @@ export default defineConfig({
   preview: {
     proxy: {
       "/route-plans": {
+        target: "http://localhost:1010",
+        changeOrigin: true,
+      },
+      "/schedules": {
         target: "http://localhost:8080",
         changeOrigin: true,
       },
