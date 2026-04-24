@@ -50,8 +50,8 @@ export type TimefoldApiPayload = {
 const BBOX_PADDING_RATIO = 0.05;
 const BBOX_PADDING_MIN = 0.002;
 
-/** Default vehicle capacity in the solver payload (packages per car). */
-export const VEHICLE_CAPACITY_TEST = 20;
+/** Default vehicle capacity in the solver payload (packages per vehicle). */
+export const DEFAULT_VEHICLE_CAPACITY = 20;
 
 /** Default service time at a stop (seconds), e.g. 30 minutes. */
 export const DEFAULT_SERVICE_DURATION_SECONDS = 1800;
@@ -131,7 +131,7 @@ export function buildTimefoldApiPayload(
       vehicleIndex += 1;
       vehicles.push({
         id: String(vehicleIndex),
-        capacity: VEHICLE_CAPACITY_TEST,
+        capacity: DEFAULT_VEHICLE_CAPACITY,
         homeLocation: asTuple(w.lat, w.lng),
         departureTime: startIso,
         visits: [],

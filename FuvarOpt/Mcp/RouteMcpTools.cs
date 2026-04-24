@@ -30,10 +30,18 @@ public sealed class RouteMcpTools
     }
 
     [McpServerTool, Description(
-        "Extract employee scheduling data (employees with skills and date preferences, shifts with id/start/end/location/requiredSkill) from the user's free-text message using Google Gemini. "
-        + "Same extraction as POST /api/schedule/from-message. Returns JSON with employees, shifts, and complete.")]
+        "Extract workforce planning JSON from the user's free-text message using Google Gemini: employees (ids, skills, shift times, hour limits, preference intervals) "
+        + "and flights (duty windows and requiredEmployees skill bundles). "
+        + "Same extraction as POST /api/schedule/from-message. Returns JSON with employees, flights, complete, missingHints. "
+        + "If the result will be submitted to the multi-day schedule API (POST /schedules/problem/multi-day on the schedule service), "
+        + "flights must satisfy: at least two distinct calendar dates among flight duration.start (i.e. not every flight may start on the same day; compare the yyyy-MM-dd date part). "
+        + "Example sentence that works for a multi-day submit: "
+        + "\"We have employees emp-1 Alice Smith and emp-2 Bob Jones with skills Driver. "
+        + "Flight FLT-A runs from 2026-06-02T06:00:00 to 2026-06-02T10:00:00 and flight FLT-B runs from 2026-06-03T14:00:00 to 2026-06-03T18:00:00; each needs one Driver.\" "
+        + "(Two different start days: 2026-06-02 and 2026-06-03.) "
+        + "A single-day problem can keep all flights on one date; use POST /schedules/problem instead of multi-day in that case.")]
     public async Task<string> ExtractScheduleFromMessage(
-        [Description("Natural language describing employees, skills, dates, and shifts to schedule.")]
+        [Description("Natural language describing employees and flights/coverage to build planning JSON.")]
         string message,
         CancellationToken cancellationToken)
     {

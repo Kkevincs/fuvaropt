@@ -2,42 +2,76 @@ using System.Collections.Generic;
 
 namespace FuvarOpt.Models;
 
-public sealed class ScheduleEmployeeDto
+public sealed class ScheduleDateTimeRangeDto
 {
+    public string Start { get; set; } = "";
+
+    public string End { get; set; } = "";
+}
+
+/// <summary>Employee row for planning JSON (flights-based schedule).</summary>
+public sealed class SchedulePlanningEmployeeDto
+{
+    public string Id { get; set; } = "";
+
     public string Name { get; set; } = "";
 
     public List<string> Skills { get; set; } = new();
 
-    public List<string> UnavailableDates { get; set; } = new();
+    public string ExpectedShiftStart { get; set; } = "";
 
-    public List<string> UndesiredDates { get; set; } = new();
+    public string EarliestShiftStart { get; set; } = "";
 
-    public List<string> DesiredDates { get; set; } = new();
+    public int DailyMinWorkingHour { get; set; }
+
+    public int DailyMaxWorkingHour { get; set; }
+
+    public int WeeklyWorkedHours { get; set; }
+
+    public int WeeklyMaxWorkingHours { get; set; }
+
+    public int MonthlyWorkedHours { get; set; }
+
+    public int MonthlyMaxWorkingHours { get; set; }
+
+    public List<ScheduleDateTimeRangeDto> UnavailableDates { get; set; } = new();
+
+    public List<ScheduleDateTimeRangeDto> UndesiredDates { get; set; } = new();
+
+    public List<ScheduleDateTimeRangeDto> DesiredDates { get; set; } = new();
 }
 
-public sealed class ScheduleShiftInputDto
+public sealed class ScheduleFlightRequiredEmployeesDto
 {
-    public string Id { get; set; } = "";
+    public List<string> Skills { get; set; } = new();
 
+    public int NumberOfEmployees { get; set; }
+}
+
+public sealed class ScheduleFlightDurationDto
+{
     public string Start { get; set; } = "";
 
     public string End { get; set; } = "";
-
-    public string Location { get; set; } = "";
-
-    public string RequiredSkill { get; set; } = "";
 }
 
-/// <summary>Structured schedule extracted from chat (same shape for REST and MCP tool).</summary>
+public sealed class ScheduleFlightDto
+{
+    public string Id { get; set; } = "";
+
+    public ScheduleFlightDurationDto Duration { get; set; } = new();
+
+    public List<ScheduleFlightRequiredEmployeesDto> RequiredEmployees { get; set; } = new();
+}
+
+/// <summary>Structured planning extract from chat (employees + flights). Same shape for REST and MCP.</summary>
 public sealed class ScheduleExtractResponse
 {
-    public List<ScheduleEmployeeDto> Employees { get; set; } = new();
+    public List<SchedulePlanningEmployeeDto> Employees { get; set; } = new();
 
-    public List<ScheduleShiftInputDto> Shifts { get; set; } = new();
+    public List<ScheduleFlightDto> Flights { get; set; } = new();
 
-    /// <summary>True when there is at least one employee and one valid shift row.</summary>
     public bool Complete { get; set; }
 
-    /// <summary>When <see cref="Complete"/> is false, human-readable items to fix (only these should be requested in follow-up).</summary>
     public List<string> MissingHints { get; set; } = new();
 }

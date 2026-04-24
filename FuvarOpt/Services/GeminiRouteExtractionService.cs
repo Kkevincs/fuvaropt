@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Net;
 using System.Net.Http;
 using System.Text;
 using System.Text.Json;
@@ -182,9 +183,11 @@ public sealed class GeminiRouteExtractionService
 
     /// <summary>
     /// Analyzes solved employee schedule JSON (employees, shifts with assignments, preferences) and returns short English insights.
+    /// When <paramref name="analyzeResponseJson"/> is set, prioritizes fixes for hard constraints, then soft (from analyze).
     /// </summary>
     public async Task<PostOptimizationSuggestionsResponse> GetPostScheduleOptimizationSuggestionsAsync(
         string solvedScheduleJson,
+        string? analyzeResponseJson,
         CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(solvedScheduleJson))
@@ -192,20 +195,45 @@ public sealed class GeminiRouteExtractionService
             throw new ArgumentException("Solved schedule JSON is required.", nameof(solvedScheduleJson));
         }
 
-        var prompt =
-            "You are given JSON from an employee scheduling optimizer: employees (name, skills, unavailableDates, "
-            + "undesiredDates, desiredDates) and shifts (id, start, end, location, requiredSkill, employee assignment). "
-            + "Respond with JSON only. Write in clear English.\n\n"
-            + "Produce 2 to 6 short suggestion strings. Each string is one line (no markdown bullets inside the string). "
-            + "Cover topics such as:\n"
-            + "- Workload imbalance: who has more shifts or longer hours than others.\n"
-            + "- Preferences: assignments on undesired days, or missing desired days; note if someone could swap to gain a rest day.\n"
-            + "- Hypotheticals: e.g. if person A swapped shift X from day Y to Z (or with person B), would they gain an extra rest day or better match preferences.\n"
-            + "- Skills vs locations: coverage gaps or overload at a single site.\n"
-            + "If the JSON is sparse, still give the best heuristic insights you can.\n\n"
-            + "suggestions: 2 to 6 short bullet strings.\n\n"
-            + "Solved schedule JSON:\n"
-            + solvedScheduleJson;
+        string prompt;
+        if (!string.IsNullOrWhiteSpace(analyzeResponseJson))
+        {
+            prompt =
+                "You are given (1) JSON from an employee scheduling optimizer: employees (name, skills, preferences) "
+                + "and shifts (id, duration, requiredSkills, employee assignment), and "
+                + "(2) JSON from PUT /schedules/analyze: constraint match analysis (hard and soft constraint causes, "
+                + "violations, match counts, weights, or similar—use the field names as they appear).\n"
+                + "Respond with JSON only. Write in clear English.\n\n"
+                + "Produce 4 to 12 short suggestion strings. Each string is one line (no markdown bullets inside the string). "
+                + "Order is critical:\n"
+                + "1. First, list every actionable suggestion that addresses **hard** constraint issues (infeasibility, "
+                + "must-fix rules, broken hard scores). Reference specific employees, shift ids, or causes from the analyze JSON when possible.\n"
+                + "2. Then, suggestions for **soft** constraint improvements (preferences, fairness, minor penalties).\n"
+                + "If analyze JSON is dense, still separate hard-related ideas before soft-related ones.\n"
+                + "If a section has nothing to say, skip it and use fewer strings total.\n\n"
+                + "suggestions: 4 to 12 strings in hard-then-soft order.\n\n"
+                + "Solved schedule JSON:\n"
+                + solvedScheduleJson
+                + "\n\nAnalyze (constraint match) JSON:\n"
+                + analyzeResponseJson;
+        }
+        else
+        {
+            prompt =
+                "You are given JSON from an employee scheduling optimizer: employees (name, skills, unavailableDates, "
+                + "undesiredDates, desiredDates) and shifts (id, start, end, location, requiredSkill, employee assignment). "
+                + "Respond with JSON only. Write in clear English.\n\n"
+                + "Produce 2 to 6 short suggestion strings. Each string is one line (no markdown bullets inside the string). "
+                + "Cover topics such as:\n"
+                + "- Workload imbalance: who has more shifts or longer hours than others.\n"
+                + "- Preferences: assignments on undesired days, or missing desired days; note if someone could swap to gain a rest day.\n"
+                + "- Hypotheticals: e.g. if person A swapped shift X from day Y to Z (or with person B), would they gain an extra rest day or better match preferences.\n"
+                + "- Skills vs locations: coverage gaps or overload at a single site.\n"
+                + "If the JSON is sparse, still give the best heuristic insights you can.\n\n"
+                + "suggestions: 2 to 6 short bullet strings.\n\n"
+                + "Solved schedule JSON:\n"
+                + solvedScheduleJson;
+        }
 
         return await GenerateJsonSuggestionsAsync(prompt, cancellationToken).ConfigureAwait(false);
     }
@@ -331,7 +359,7 @@ public sealed class GeminiRouteExtractionService
     }
 
     /// <summary>
-    /// Extracts employees and shifts from free text (same logic as MCP tool <c>ExtractScheduleFromMessage</c>).
+    /// Extracts employees and flights (coverage demand) from free text (same logic as MCP tool <c>ExtractScheduleFromMessage</c>).
     /// </summary>
     public async Task<ScheduleExtractResponse> ExtractScheduleFromMessageAsync(
         string userMessage,
@@ -349,41 +377,38 @@ public sealed class GeminiRouteExtractionService
             ?? Environment.GetEnvironmentVariable("GEMINI_MODEL")
             ?? _options.Value.Model;
 
-        var prompt =
-            "You extract structured employee scheduling data for an optimizer API. Output must satisfy the JSON schema.\n\n"
-            + "MULTIPLE EMPLOYEES: If the user says they have N employees or lists names (e.g. \"Josh and Adam\"), you MUST output exactly N entries in the employees array—never merge into one. "
-            + "Each distinct paragraph or sentence block that describes a different person (different skills, days, or preferences) is a separate employee. "
-            + "If the user repeats the wrong name in a later sentence (e.g. says \"Adam\" again when describing the second person), treat it as a typo: assign that block to the other named person from the introduction (e.g. the first block is Adam, the second block with Python/C# is Josh). "
-            + "Use the names from the opening line when resolving conflicts.\n\n"
-            + "EMPLOYEES: For each person: name, skills (string list), unavailableDates, undesiredDates, desiredDates. "
-            + "Dates in those arrays must be YYYY-MM-DD only. "
-            + "When the user gives a calendar week or date range and says they prefer or cannot work on certain weekdays, "
-            + "convert each weekday to the actual calendar date that falls inside that range (e.g. for 2026-04-19 to 2026-04-24, "
-            + "Monday is 2026-04-20, Tuesday 2026-04-21, Wednesday 2026-04-22, Thursday 2026-04-23, Friday 2026-04-24, "
-            + "unless the user’s locale implies a different mapping—use the dates that match their stated week).\n\n"
-            + "SHIFTS: Each shift needs id, start, end (ISO 8601 with full date and time), location, requiredSkill. "
-            + "Every shift **location** must be a concrete city, site, or office name (e.g. Budapest, Ambulatory care)—never generic placeholders like \"Unspecified\" or \"TBD\". "
-            + "When the user states which skills are needed on which days (e.g. Excel on Mon/Tue/Fri, Python on Wed, Excel+Python on Thu), "
-            + "expand that into one shift per distinct (calendar day, required skill): use a working-day window such as 09:00–17:00 local on that date. "
-            + "If multiple skills apply the same day, output one shift per skill. "
-            + "If the user did not name a location for a shift, infer a reasonable one from context or omit that shift until the user provides it in a follow-up.\n\n"
-            + "Each employee must have **at least one non-empty skill** in the skills array.\n\n"
-            + "Use stable ids such as \"2026-04-20-excel\", \"2026-04-23-python\".\n\n"
-            + "Do not return an empty shifts array when the user has described concrete scheduling needs for days or skills in a week. "
-            + "Use empty arrays for employee date lists only when the user did not mention those preferences.\n\n"
-            + "PREFERENCE COVERAGE: If the user names several people and states likes, dislikes, cannot work, or preferred days for some of them but not for another named person, "
-            + "that person still needs either the same kind of preference detail or an explicit note that they have no preference / are flexible—do not silently leave them with empty date arrays while others are filled. "
-            + "Never invent or guess preference dates for someone whose likes/dislikes you were not told; leave arrays empty for them so the app can ask.\n\n"
-            + $"DEMO LIMITS (enforced by the server after extraction, not by you truncating): at most {DemoScheduleMaxEmployees} employees; "
-            + $"at most {DemoScheduleMaxSkillsPerEmployee} skills per employee; "
-            + "all shift start/end times within one calendar window of 7 days (earliest shift start to latest shift end). "
-            + "SKILLS ARRAY: Include **every** distinct job title or role the user gives for each person as a separate string in `skills`. "
-            + "Do **not** merge or drop roles to stay under a limit—if they list more than three roles for someone, output all of them; the demo will mark the extract incomplete and ask them to use at most three. "
-            + "Never silently omit the last roles.\n\n"
-            + "User message:\n"
-            + userMessage;
+        var isPlanRefine = userMessage.Contains("---BEGIN_CURRENT_PLAN_JSON---", StringComparison.Ordinal)
+            && userMessage.Contains("---END_CURRENT_PLAN_JSON---", StringComparison.Ordinal);
 
-        var schema = BuildScheduleExtractionSchema();
+        var basePrompt =
+            "You extract structured workforce planning JSON (ProblemDTO) for an API. Follow the JSON schema; never use JSON null for employees, flights, or skills—use [] for empty arrays.\n\n"
+            + "REQUIRED for a meaningful schedule:\n"
+            + "- employees[]: each object should have id, name, skills (array of strings; never null). For a real solve use at least one non-empty skill per person.\n"
+            + "- flights[]: each object has id, duration { start, end } in yyyy-MM-dd'T'HH:mm:ss (or full ISO; always use T between date and time—if the user wrote \"2026-06-02 06:00\", output \"2026-06-02T06:00:00\"), and requiredEmployees: array of { skills: string[], numberOfEmployees: integer } "
+            + "with numberOfEmployees >= 1 and skills as a non-null array (can be empty only if the user explicitly allows no skill filter—prefer at least one skill when demand is stated).\n\n"
+            + "OPTIONAL (omit or use 0 / empty arrays if not mentioned):\n"
+            + "- employees: expectedShiftStart, earliestShiftStart as full ISO local date-time (yyyy-MM-dd'T'HH:mm:ss) or omit; "
+            + "never output time-only strings like \"04:00:00\" (invalid for APIs that use LocalDateTime). "
+            + "dailyMinWorkingHour, dailyMaxWorkingHour; weekly/monthly hour counters; unavailableDates, undesiredDates, desiredDates as arrays of { start, end } using the same full date-time form for each start/end.\n\n"
+            + "MULTIPLE EMPLOYEES: If the user lists N people, output N employee rows—never merge.\n"
+            + "PREFERENCE COVERAGE: If some employees have preference intervals and others do not, leave missing ones as empty arrays.\n\n"
+            + "MULTI-DAY API: If the user wants coverage across more than one calendar day (or the downstream app will call POST /schedules/problem/multi-day), "
+            + "include at least two flights whose duration.start falls on two different dates (compare yyyy-MM-dd). "
+            + "For a single planning day, all flights may share the same date; for multi-day, split duties across at least two start dates.\n\n"
+            + $"DEMO LIMITS (server-enforced): at most {DemoScheduleMaxEmployees} employees; "
+            + $"at most {DemoScheduleMaxSkillsPerEmployee} skills per employee; "
+            + "all flight duration start/end times within 7 days from earliest flight start to latest flight end.\n\n";
+
+        var refineBlock = isPlanRefine
+            ? "REFINEMENT: The user message may include a block ---BEGIN_CURRENT_PLAN_JSON--- ... ---END_CURRENT_PLAN_JSON--- with the current plan. "
+            + "In that case, apply the 'User instruction' to that plan and output the FULL updated `employees` and `flights` (complete JSON). "
+            + "Keep stable `id` values for rows that are not removed. Add, remove, or change flights and employees as requested. "
+            + "Do not output a partial diff only—return the same schema as a fresh extract.\n\n"
+            : "";
+
+        var prompt = basePrompt + refineBlock + "User message:\n" + userMessage;
+
+        var schema = BuildSchedulePlanningExtractionSchema();
 
         var body = new JsonObject
         {
@@ -422,69 +447,245 @@ public sealed class GeminiRouteExtractionService
 
         if (!response.IsSuccessStatusCode)
         {
+            var errMsg = TryGetGeminiHttpErrorMessage(responseText) ?? responseText;
+            if (response.StatusCode == HttpStatusCode.BadRequest
+                && (errMsg.Contains("deserialize", StringComparison.OrdinalIgnoreCase)
+                    || errMsg.Contains("invalid json", StringComparison.OrdinalIgnoreCase)))
+            {
+                return BuildIncompleteScheduleExtract(
+                    new List<string>
+                    {
+                        "The AI service rejected the request format (" + errMsg + ").",
+                        "Rephrase in short lines: one employee per line with id, name, and a skills array; one flight per block with start/end in ISO-8601 using T (yyyy-MM-ddTHH:mm:ss) and requiredEmployees entries.",
+                    },
+                    addStandardRecoveryHints: true);
+            }
+
             throw new InvalidOperationException(
-                $"Gemini API error {(int)response.StatusCode}: {responseText}");
+                $"Gemini API error {(int)response.StatusCode}: {errMsg}");
         }
 
-        using var doc = JsonDocument.Parse(responseText);
-        var root = doc.RootElement;
-        var text = root
-            .GetProperty("candidates")[0]
-            .GetProperty("content")
-            .GetProperty("parts")[0]
-            .GetProperty("text")
-            .GetString();
-
-        if (string.IsNullOrWhiteSpace(text))
+        if (!TryGetGeminiModelTextFromResponse(
+                responseText,
+                out var text,
+                out var extractFailure))
         {
-            throw new InvalidOperationException("Empty Gemini response.");
+            return BuildIncompleteScheduleExtract(
+                new List<string> { extractFailure },
+                addStandardRecoveryHints: true);
         }
 
-        var parsed = JsonSerializer.Deserialize<ScheduleGeminiRoot>(
-            text,
-            new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+        SchedulePlanningGeminiRoot? parsed;
+        try
+        {
+            parsed = JsonSerializer.Deserialize<SchedulePlanningGeminiRoot>(
+                text!,
+                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+        }
+        catch (JsonException ex)
+        {
+            return BuildIncompleteScheduleExtract(
+                new List<string>
+                {
+                    "The model's reply was not valid schedule JSON. " + ex.Message,
+                },
+                addStandardRecoveryHints: true);
+        }
 
         if (parsed is null)
         {
-            throw new InvalidOperationException("Could not parse Gemini JSON: " + text);
+            return BuildIncompleteScheduleExtract(
+                new List<string> { "The model's reply could not be read as schedule data (empty result)." },
+                addStandardRecoveryHints: true);
         }
 
-        var employees = parsed.Employees ?? new List<ScheduleEmployeeDto>();
-        var shifts = parsed.Shifts ?? new List<ScheduleShiftInputDto>();
+        var employees = parsed.Employees ?? new List<SchedulePlanningEmployeeDto>();
+        var flights = parsed.Flights ?? new List<ScheduleFlightDto>();
 
-        NormalizeEmployeesAfterExtraction(employees);
-        NormalizeShiftsAfterExtraction(shifts);
+        NormalizePlanningEmployeesAfterExtraction(employees);
+        NormalizeFlightsAfterExtraction(flights);
 
-        var missingHints = CollectScheduleIssues(employees, shifts, userMessage);
+        var missingHints = CollectPlanningScheduleIssues(employees, flights, userMessage);
 
         return new ScheduleExtractResponse
         {
             Employees = employees,
-            Shifts = shifts,
+            Flights = flights,
             Complete = missingHints.Count == 0,
             MissingHints = missingHints,
         };
     }
 
-    private static void NormalizeEmployeesAfterExtraction(IList<ScheduleEmployeeDto> employees)
+    private static ScheduleExtractResponse BuildIncompleteScheduleExtract(
+        List<string> headHints,
+        bool addStandardRecoveryHints = true)
     {
-        foreach (var e in employees)
+        if (addStandardRecoveryHints)
         {
-            e.Skills ??= new List<string>();
-            e.UnavailableDates ??= new List<string>();
-            e.UndesiredDates ??= new List<string>();
-            e.DesiredDates ??= new List<string>();
+            foreach (var h in GetStandardScheduleRecoveryHints())
+            {
+                if (!headHints.Contains(h))
+                {
+                    headHints.Add(h);
+                }
+            }
+        }
+
+        return new ScheduleExtractResponse
+        {
+            Employees = new List<SchedulePlanningEmployeeDto>(),
+            Flights = new List<ScheduleFlightDto>(),
+            Complete = false,
+            MissingHints = headHints,
+        };
+    }
+
+    private static IReadOnlyList<string> GetStandardScheduleRecoveryHints() =>
+        new[]
+        {
+            "Each employee needs: id (string), name (string), skills (JSON array with at least one non-empty skill).",
+            "Each flight needs: id (string); duration.start and duration.end as ISO datetimes with T (yyyy-MM-ddTHH:mm:ss); requiredEmployees as [{ skills: string[], numberOfEmployees: integer ≥ 1 }].",
+            "Multi-day API only: at least two flights must have duration.start on different calendar days (not all starts on the same yyyy-MM-dd).",
+        };
+
+    private static string? TryGetGeminiHttpErrorMessage(string responseText)
+    {
+        try
+        {
+            using var d = JsonDocument.Parse(responseText);
+            if (d.RootElement.TryGetProperty("error", out var err)
+                && err.TryGetProperty("message", out var m))
+            {
+                return m.GetString();
+            }
+        }
+        catch (JsonException)
+        {
+        }
+
+        return null;
+    }
+
+    private static bool TryGetGeminiModelTextFromResponse(
+        string responseText,
+        out string? text,
+        out string failureReason)
+    {
+        text = null;
+        failureReason = string.Empty;
+
+        JsonDocument doc;
+        try
+        {
+            doc = JsonDocument.Parse(responseText);
+        }
+        catch (JsonException ex)
+        {
+            failureReason = "Gemini response was not valid JSON: " + ex.Message;
+            return false;
+        }
+
+        using (doc)
+        {
+            var root = doc.RootElement;
+
+            if (root.TryGetProperty("promptFeedback", out var feedback)
+                && feedback.TryGetProperty("blockReason", out var block))
+            {
+                failureReason =
+                    "The model blocked this input (blockReason: " + (block.GetString() ?? block.ToString()) + ").";
+                return false;
+            }
+
+            if (root.TryGetProperty("candidates", out var cands) && cands.GetArrayLength() > 0)
+            {
+                var c0 = cands[0];
+                if (c0.TryGetProperty("content", out var content)
+                    && content.TryGetProperty("parts", out var parts)
+                    && parts.GetArrayLength() > 0
+                    && parts[0].TryGetProperty("text", out var textEl))
+                {
+                    text = textEl.GetString();
+                    if (!string.IsNullOrWhiteSpace(text))
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            failureReason = "The model did not return schedule text (empty response or missing candidates/parts).";
+            return false;
         }
     }
 
-    private static void NormalizeShiftsAfterExtraction(IList<ScheduleShiftInputDto> shifts)
+    private static string NormalizeSpaceSeparatedIsoDateTime(string? s)
     {
-        for (var i = 0; i < shifts.Count; i++)
+        if (string.IsNullOrWhiteSpace(s))
         {
-            var s = shifts[i];
-            if (string.IsNullOrWhiteSpace(s.Id))
+            return string.Empty;
+        }
+
+        var t = s.Trim();
+        if (t.Length >= 11 && t[4] == '-' && t[7] == '-' && t[10] == ' ')
+        {
+            return t.Substring(0, 10) + "T" + t.Substring(11);
+        }
+
+        return t;
+    }
+
+    private static void NormalizePlanningEmployeesAfterExtraction(IList<SchedulePlanningEmployeeDto> employees)
+    {
+        for (var i = 0; i < employees.Count; i++)
+        {
+            var e = employees[i];
+            e.Skills ??= new List<string>();
+            e.UnavailableDates ??= new List<ScheduleDateTimeRangeDto>();
+            e.UndesiredDates ??= new List<ScheduleDateTimeRangeDto>();
+            e.DesiredDates ??= new List<ScheduleDateTimeRangeDto>();
+            e.ExpectedShiftStart ??= string.Empty;
+            e.EarliestShiftStart ??= string.Empty;
+            if (string.IsNullOrWhiteSpace(e.Id) && !string.IsNullOrWhiteSpace(e.Name))
             {
-                s.Id = $"shift-{i + 1}";
+                e.Id = $"emp-{SlugId(e.Name)}-{i + 1}";
+            }
+            else if (string.IsNullOrWhiteSpace(e.Id))
+            {
+                e.Id = $"employee-{i + 1}";
+            }
+        }
+    }
+
+    private static string SlugId(string name)
+    {
+        var t = name.Trim().ToLowerInvariant();
+        var chars = t.Where(c => char.IsLetterOrDigit(c) || c == '-').ToArray();
+        var s = new string(chars);
+        return s.Length > 0 ? s : "x";
+    }
+
+    private static void NormalizeFlightsAfterExtraction(IList<ScheduleFlightDto> flights)
+    {
+        for (var i = 0; i < flights.Count; i++)
+        {
+            var f = flights[i];
+            if (f.Duration is null)
+            {
+                f.Duration = new ScheduleFlightDurationDto();
+            }
+
+            f.Duration.Start = NormalizeSpaceSeparatedIsoDateTime(f.Duration.Start);
+            f.Duration.End = NormalizeSpaceSeparatedIsoDateTime(f.Duration.End);
+
+            f.RequiredEmployees ??= new List<ScheduleFlightRequiredEmployeesDto>();
+            foreach (var re in f.RequiredEmployees)
+            {
+                re.Skills ??= new List<string>();
+            }
+
+            if (string.IsNullOrWhiteSpace(f.Id))
+            {
+                f.Id = $"flight-{i + 1}";
             }
         }
     }
@@ -499,24 +700,13 @@ public sealed class GeminiRouteExtractionService
         return skills.Any(s => !string.IsNullOrWhiteSpace(s));
     }
 
-    private static bool IsPlaceholderLocation(string? location)
-    {
-        if (string.IsNullOrWhiteSpace(location))
-        {
-            return true;
-        }
-
-        var t = location.Trim().ToLowerInvariant();
-        return t is "unspecified" or "tbd" or "n/a" or "na" or "none" or "-" or "unknown";
-    }
-
     /// <summary>
     /// When the user explicitly names multiple people but Gemini returns fewer employee rows (e.g. duplicate \"Adam\" typo for Josh),
     /// add a targeted hint so the UI can ask only for the missing person.
     /// </summary>
     private static void AppendRosterMismatchHints(
         string userMessage,
-        IReadOnlyList<ScheduleEmployeeDto> employees,
+        IReadOnlyList<SchedulePlanningEmployeeDto> employees,
         List<string> issues)
     {
         if (string.IsNullOrWhiteSpace(userMessage))
@@ -543,91 +733,168 @@ public sealed class GeminiRouteExtractionService
         }
     }
 
-    /// <summary>Lists concrete problems with the extracted JSON so the UI only asks for what is still missing.</summary>
-    private static List<string> CollectScheduleIssues(
-        IReadOnlyList<ScheduleEmployeeDto> employees,
-        IReadOnlyList<ScheduleShiftInputDto> shifts,
+    /// <summary>Lists concrete problems with the extracted planning JSON so the UI only asks for what is still missing.</summary>
+    private static List<string> CollectPlanningScheduleIssues(
+        IReadOnlyList<SchedulePlanningEmployeeDto> employees,
+        IReadOnlyList<ScheduleFlightDto> flights,
         string userMessage)
     {
         var issues = new List<string>();
 
         if (employees.Count < 1)
         {
-            issues.Add("Add at least one employee (name is required).");
+            issues.Add("Add at least one employee (id and name are required).");
         }
 
-        if (shifts.Count < 1)
+        if (flights.Count < 1)
         {
-            issues.Add("Add at least one shift (id, start, end, location, required skill).");
+            issues.Add("Add at least one flight (id, duration start/end, and requiredEmployees).");
         }
 
         AppendRosterMismatchHints(userMessage, employees, issues);
 
-        AppendPreferenceCoverageHints(employees, userMessage, issues);
+        AppendPlanningPreferenceCoverageHints(employees, userMessage, issues);
 
         for (var i = 0; i < employees.Count; i++)
         {
-            if (string.IsNullOrWhiteSpace(employees[i].Name))
+            var e = employees[i];
+            var empLabel = string.IsNullOrWhiteSpace(e.Name) ? $"employees[{i}]" : $"\"{e.Name.Trim()}\" (employees[{i}])";
+
+            if (string.IsNullOrWhiteSpace(e.Id))
             {
-                issues.Add($"employees[{i}].name: must be a non-empty string.");
+                issues.Add($"{empLabel}: id is required in the JSON (non-empty string).");
             }
-            else if (!HasAtLeastOneNonEmptySkill(employees[i].Skills))
+
+            if (string.IsNullOrWhiteSpace(e.Name))
             {
-                issues.Add($"employees[{i}].skills: add at least one skill for this employee.");
+                issues.Add($"employees[{i}].name: is required in the JSON (non-empty string).");
             }
+
+            if (!HasAtLeastOneNonEmptySkill(e.Skills))
+            {
+                issues.Add(
+                    $"{empLabel}: skills is required—use a JSON array with at least one non-empty skill string (never null; use [] only after you add real skills in your next message).");
+            }
+
+            if (!string.IsNullOrWhiteSpace(e.ExpectedShiftStart)
+                && !DateTime.TryParse(e.ExpectedShiftStart, out _))
+            {
+                issues.Add($"employees[{i}].expectedShiftStart: not a valid datetime (got \"{e.ExpectedShiftStart}\").");
+            }
+
+            if (!string.IsNullOrWhiteSpace(e.EarliestShiftStart)
+                && !DateTime.TryParse(e.EarliestShiftStart, out _))
+            {
+                issues.Add($"employees[{i}].earliestShiftStart: not a valid datetime (got \"{e.EarliestShiftStart}\").");
+            }
+
+            AppendRangeListIssues(issues, e.UnavailableDates, $"employees[{i}].unavailableDates");
+            AppendRangeListIssues(issues, e.UndesiredDates, $"employees[{i}].undesiredDates");
+            AppendRangeListIssues(issues, e.DesiredDates, $"employees[{i}].desiredDates");
         }
 
-        for (var i = 0; i < shifts.Count; i++)
+        for (var i = 0; i < flights.Count; i++)
         {
-            var s = shifts[i];
-            var label = string.IsNullOrWhiteSpace(s.Id)
-                ? $"shifts[{i}]"
-                : $"shifts[{i}] (id \"{s.Id.Trim()}\")";
+            var f = flights[i];
+            var label = string.IsNullOrWhiteSpace(f.Id)
+                ? $"flights[{i}]"
+                : $"flights[{i}] (id \"{f.Id.Trim()}\")";
 
-            if (string.IsNullOrWhiteSpace(s.Id))
+            if (string.IsNullOrWhiteSpace(f.Id))
             {
                 issues.Add($"{label}: id is missing or empty.");
             }
 
-            if (string.IsNullOrWhiteSpace(s.Start))
+            var d = f.Duration;
+            if (d is null)
             {
-                issues.Add($"{label}.start: missing (use ISO datetime, e.g. 2022-03-10T08:00:00).");
+                issues.Add($"{label}.duration: missing.");
             }
-            else if (!DateTime.TryParse(s.Start, out _))
+            else
             {
-                issues.Add($"{label}.start: not a valid datetime (got \"{s.Start}\").");
+                if (string.IsNullOrWhiteSpace(d.Start))
+                {
+                    issues.Add($"{label}.duration.start: missing (ISO datetime).");
+                }
+                else if (!DateTime.TryParse(d.Start, out _))
+                {
+                    issues.Add($"{label}.duration.start: not a valid datetime (got \"{d.Start}\").");
+                }
+
+                if (string.IsNullOrWhiteSpace(d.End))
+                {
+                    issues.Add($"{label}.duration.end: missing (ISO datetime).");
+                }
+                else if (!DateTime.TryParse(d.End, out _))
+                {
+                    issues.Add($"{label}.duration.end: not a valid datetime (got \"{d.End}\").");
+                }
+
+                if (DateTime.TryParse(d.Start, out var ts)
+                    && DateTime.TryParse(d.End, out var te)
+                    && te <= ts)
+                {
+                    issues.Add($"{label}: duration end must be after start.");
+                }
             }
 
-            if (string.IsNullOrWhiteSpace(s.End))
+            if (f.RequiredEmployees is null || f.RequiredEmployees.Count < 1)
             {
-                issues.Add($"{label}.end: missing (use ISO datetime).");
+                issues.Add($"{label}.requiredEmployees: add at least one entry with skills and numberOfEmployees.");
             }
-            else if (!DateTime.TryParse(s.End, out _))
+            else
             {
-                issues.Add($"{label}.end: not a valid datetime (got \"{s.End}\").");
-            }
+                for (var r = 0; r < f.RequiredEmployees.Count; r++)
+                {
+                    var re = f.RequiredEmployees[r];
+                    if (!HasAtLeastOneNonEmptySkill(re.Skills))
+                    {
+                        issues.Add($"{label}.requiredEmployees[{r}].skills: add at least one skill.");
+                    }
 
-            if (IsPlaceholderLocation(s.Location))
-            {
-                issues.Add($"{label}.location: add a city or site name (not empty or generic placeholders like \"Unspecified\").");
-            }
-
-            if (string.IsNullOrWhiteSpace(s.RequiredSkill))
-            {
-                issues.Add($"{label}.requiredSkill: missing or empty.");
-            }
-
-            if (DateTime.TryParse(s.Start, out var ts)
-                && DateTime.TryParse(s.End, out var te)
-                && te <= ts)
-            {
-                issues.Add($"{label}: end must be after start.");
+                    if (re.NumberOfEmployees < 1)
+                    {
+                        issues.Add($"{label}.requiredEmployees[{r}].numberOfEmployees: must be at least 1.");
+                    }
+                }
             }
         }
 
-        AppendDemoScheduleLimits(employees, shifts, issues);
+        AppendDemoPlanningScheduleLimits(employees, flights, issues);
 
         return issues;
+    }
+
+    private static void AppendRangeListIssues(
+        List<string> issues,
+        IReadOnlyList<ScheduleDateTimeRangeDto>? ranges,
+        string prefix)
+    {
+        if (ranges is null || ranges.Count == 0)
+        {
+            return;
+        }
+
+        for (var i = 0; i < ranges.Count; i++)
+        {
+            var r = ranges[i];
+            if (string.IsNullOrWhiteSpace(r.Start) || !DateTime.TryParse(r.Start, out _))
+            {
+                issues.Add($"{prefix}[{i}].start: invalid or missing datetime.");
+            }
+
+            if (string.IsNullOrWhiteSpace(r.End) || !DateTime.TryParse(r.End, out _))
+            {
+                issues.Add($"{prefix}[{i}].end: invalid or missing datetime.");
+            }
+
+            if (DateTime.TryParse(r.Start, out var ts)
+                && DateTime.TryParse(r.End, out var te)
+                && te < ts)
+            {
+                issues.Add($"{prefix}[{i}]: end must not be before start.");
+            }
+        }
     }
 
     private static int CountNonEmptySkills(IReadOnlyList<string>? skills)
@@ -640,13 +907,11 @@ public sealed class GeminiRouteExtractionService
         return skills.Count(s => !string.IsNullOrWhiteSpace(s));
     }
 
-    private static void AppendDemoScheduleLimits(
-        IReadOnlyList<ScheduleEmployeeDto> employees,
-        IReadOnlyList<ScheduleShiftInputDto> shifts,
+    private static void AppendDemoPlanningScheduleLimits(
+        IReadOnlyList<SchedulePlanningEmployeeDto> employees,
+        IReadOnlyList<ScheduleFlightDto> flights,
         List<string> issues)
     {
-        // Check skills before headcount so users see the right demo message when many comma-separated roles
-        // were mis-counted as "extra people" under old text heuristics.
         for (var i = 0; i < employees.Count; i++)
         {
             var n = CountNonEmptySkills(employees[i].Skills);
@@ -669,10 +934,12 @@ public sealed class GeminiRouteExtractionService
 
         DateTime? minStart = null;
         DateTime? maxEnd = null;
-        foreach (var s in shifts)
+        foreach (var f in flights)
         {
-            if (!DateTime.TryParse(s.Start, out var ts)
-                || !DateTime.TryParse(s.End, out var te)
+            var d = f.Duration;
+            if (d is null
+                || !DateTime.TryParse(d.Start, out var ts)
+                || !DateTime.TryParse(d.End, out var te)
                 || te <= ts)
             {
                 continue;
@@ -688,21 +955,23 @@ public sealed class GeminiRouteExtractionService
             if (span > DemoScheduleMaxShiftWindow)
             {
                 issues.Add(
-                    $"This is a demo app: all shifts must fall within {DemoScheduleMaxShiftWindow.TotalDays:F0} days from the earliest shift start to the latest shift end "
+                    $"This is a demo app: all flights must fall within {DemoScheduleMaxShiftWindow.TotalDays:F0} days from the earliest flight start to the latest flight end "
                     + $"(got ~{span.TotalDays:F1} days). Narrow the planning window or split the problem.");
             }
         }
     }
 
-    private static bool HasAnyPreferenceDates(ScheduleEmployeeDto e) =>
-        e.DesiredDates.Count > 0 || e.UndesiredDates.Count > 0 || e.UnavailableDates.Count > 0;
+    private static bool HasAnyPlanningPreferenceDates(SchedulePlanningEmployeeDto e) =>
+        (e.DesiredDates?.Count > 0)
+        || (e.UndesiredDates?.Count > 0)
+        || (e.UnavailableDates?.Count > 0);
 
     /// <summary>
-    /// If some employees have preference dates filled (or the user text describes preferences near some names) but
-    /// others do not, require follow-up for the missing people (e.g. Anna/Blake/Adam described, Elisa not).
+    /// If some employees have preference intervals filled (or the user text describes preferences near some names) but
+    /// others do not, require follow-up for the missing people.
     /// </summary>
-    private static void AppendPreferenceCoverageHints(
-        IReadOnlyList<ScheduleEmployeeDto> employees,
+    private static void AppendPlanningPreferenceCoverageHints(
+        IReadOnlyList<SchedulePlanningEmployeeDto> employees,
         string userMessage,
         List<string> issues)
     {
@@ -711,7 +980,7 @@ public sealed class GeminiRouteExtractionService
             return;
         }
 
-        var anyHasExtractedPreferences = employees.Any(HasAnyPreferenceDates);
+        var anyHasExtractedPreferences = employees.Any(HasAnyPlanningPreferenceDates);
         var anyNameHasTextPreferenceDescription = employees.Any(
             e => !string.IsNullOrWhiteSpace(e.Name) && UserMessageDescribesPreferencesNearName(userMessage, e.Name));
 
@@ -727,7 +996,7 @@ public sealed class GeminiRouteExtractionService
                 continue;
             }
 
-            if (HasAnyPreferenceDates(e))
+            if (HasAnyPlanningPreferenceDates(e))
             {
                 continue;
             }
@@ -856,7 +1125,7 @@ public sealed class GeminiRouteExtractionService
         return false;
     }
 
-    private static JsonObject BuildScheduleExtractionSchema()
+    private static JsonObject BuildSchedulePlanningExtractionSchema()
     {
         static JsonObject StringArraySchema() =>
             new JsonObject
@@ -865,41 +1134,85 @@ public sealed class GeminiRouteExtractionService
                 ["items"] = new JsonObject { ["type"] = "STRING" },
             };
 
+        // Each ARRAY `items` must be its own JsonNode tree; reusing one JsonObject throws "The node already has a parent."
+        static JsonObject CreateDateRangeItemSchema() =>
+            new JsonObject
+            {
+                ["type"] = "OBJECT",
+                ["properties"] = new JsonObject
+                {
+                    ["start"] = new JsonObject { ["type"] = "STRING" },
+                    ["end"] = new JsonObject { ["type"] = "STRING" },
+                },
+                ["required"] = new JsonArray("start", "end"),
+            };
+
+        static JsonObject RangeArraySchema() =>
+            new JsonObject
+            {
+                ["type"] = "ARRAY",
+                ["items"] = CreateDateRangeItemSchema(),
+            };
+
         var employeeProps = new JsonObject
         {
+            ["id"] = new JsonObject { ["type"] = "STRING" },
             ["name"] = new JsonObject { ["type"] = "STRING" },
             ["skills"] = StringArraySchema(),
-            ["unavailableDates"] = StringArraySchema(),
-            ["undesiredDates"] = StringArraySchema(),
-            ["desiredDates"] = StringArraySchema(),
+            ["expectedShiftStart"] = new JsonObject { ["type"] = "STRING" },
+            ["earliestShiftStart"] = new JsonObject { ["type"] = "STRING" },
+            ["dailyMinWorkingHour"] = new JsonObject { ["type"] = "INTEGER" },
+            ["dailyMaxWorkingHour"] = new JsonObject { ["type"] = "INTEGER" },
+            ["weeklyWorkedHours"] = new JsonObject { ["type"] = "INTEGER" },
+            ["weeklyMaxWorkingHours"] = new JsonObject { ["type"] = "INTEGER" },
+            ["monthlyWorkedHours"] = new JsonObject { ["type"] = "INTEGER" },
+            ["monthlyMaxWorkingHours"] = new JsonObject { ["type"] = "INTEGER" },
+            ["unavailableDates"] = RangeArraySchema(),
+            ["undesiredDates"] = RangeArraySchema(),
+            ["desiredDates"] = RangeArraySchema(),
         };
 
         var employeeItem = new JsonObject
         {
             ["type"] = "OBJECT",
             ["properties"] = employeeProps,
-            ["required"] = new JsonArray(
-                "name",
-                "skills",
-                "unavailableDates",
-                "undesiredDates",
-                "desiredDates"),
+            ["required"] = new JsonArray("id", "name", "skills"),
         };
 
-        var shiftProps = new JsonObject
-        {
-            ["id"] = new JsonObject { ["type"] = "STRING" },
-            ["start"] = new JsonObject { ["type"] = "STRING" },
-            ["end"] = new JsonObject { ["type"] = "STRING" },
-            ["location"] = new JsonObject { ["type"] = "STRING" },
-            ["requiredSkill"] = new JsonObject { ["type"] = "STRING" },
-        };
-
-        var shiftItem = new JsonObject
+        var reqEmpItem = new JsonObject
         {
             ["type"] = "OBJECT",
-            ["properties"] = shiftProps,
-            ["required"] = new JsonArray("id", "start", "end", "location", "requiredSkill"),
+            ["properties"] = new JsonObject
+            {
+                ["skills"] = StringArraySchema(),
+                ["numberOfEmployees"] = new JsonObject { ["type"] = "INTEGER" },
+            },
+            ["required"] = new JsonArray("skills", "numberOfEmployees"),
+        };
+
+        var flightItem = new JsonObject
+        {
+            ["type"] = "OBJECT",
+            ["properties"] = new JsonObject
+            {
+                ["id"] = new JsonObject { ["type"] = "STRING" },
+                ["duration"] = new JsonObject
+                {
+                    ["type"] = "OBJECT",
+                    ["properties"] = new JsonObject
+                    {
+                        ["start"] = new JsonObject { ["type"] = "STRING" },
+                        ["end"] = new JsonObject { ["type"] = "STRING" },
+                    },
+                    ["required"] = new JsonArray("start", "end"),
+                },
+                ["requiredEmployees"] = new JsonObject
+                {
+                    ["type"] = "ARRAY",
+                    ["items"] = reqEmpItem,
+                },
+            },
+            ["required"] = new JsonArray("id", "duration", "requiredEmployees"),
         };
 
         return new JsonObject
@@ -912,21 +1225,21 @@ public sealed class GeminiRouteExtractionService
                     ["type"] = "ARRAY",
                     ["items"] = employeeItem,
                 },
-                ["shifts"] = new JsonObject
+                ["flights"] = new JsonObject
                 {
                     ["type"] = "ARRAY",
-                    ["items"] = shiftItem,
+                    ["items"] = flightItem,
                 },
             },
-            ["required"] = new JsonArray("employees", "shifts"),
+            ["required"] = new JsonArray("employees", "flights"),
         };
     }
 
-    private sealed class ScheduleGeminiRoot
+    private sealed class SchedulePlanningGeminiRoot
     {
-        public List<ScheduleEmployeeDto>? Employees { get; set; }
+        public List<SchedulePlanningEmployeeDto>? Employees { get; set; }
 
-        public List<ScheduleShiftInputDto>? Shifts { get; set; }
+        public List<ScheduleFlightDto>? Flights { get; set; }
     }
 
     /// <summary>Gemini response schema: warehouses, vehicles, addresses only (no packages).</summary>

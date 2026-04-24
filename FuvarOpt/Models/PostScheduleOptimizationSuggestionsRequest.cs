@@ -4,4 +4,7 @@ namespace FuvarOpt.Models;
 public sealed class PostScheduleOptimizationSuggestionsRequest
 {
     public string SolvedScheduleJson { get; set; } = "";
+
+    /// <summary>Optional JSON from PUT /schedules/analyze (constraint match — hard/soft causes).</summary>
+    public string? AnalyzeResponseJson { get; set; }
 }

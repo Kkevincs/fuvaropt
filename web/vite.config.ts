@@ -14,6 +14,18 @@ export default defineConfig({
         target: "http://localhost:8080",
         changeOrigin: true,
       },
+      /**
+       * Planning API on 8081: browser calls same-origin `/schedule-solver/...` (no CORS);
+       * forwarded to e.g. `http://localhost:8081/schedules/problem`.
+       */
+      "/schedule-solver": {
+        target: "http://localhost:8081",
+        changeOrigin: true,
+        /** Multi-day solve can run a long time; default proxy timeout may return an empty 200. */
+        timeout: 1_200_000,
+        proxyTimeout: 1_200_000,
+        rewrite: (path) => path.replace(/^\/schedule-solver/, ""),
+      },
     },
   },
   preview: {
@@ -25,6 +37,14 @@ export default defineConfig({
       "/schedules": {
         target: "http://localhost:8080",
         changeOrigin: true,
+      },
+      "/schedule-solver": {
+        target: "http://localhost:8081",
+        changeOrigin: true,
+        /** Multi-day solve can run a long time; default proxy timeout may return an empty 200. */
+        timeout: 1_200_000,
+        proxyTimeout: 1_200_000,
+        rewrite: (path) => path.replace(/^\/schedule-solver/, ""),
       },
     },
   },

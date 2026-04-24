@@ -174,7 +174,10 @@ public static class Program
                     try
                     {
                         var result = await gemini
-                            .GetPostScheduleOptimizationSuggestionsAsync(body.SolvedScheduleJson, cancellationToken)
+                            .GetPostScheduleOptimizationSuggestionsAsync(
+                                body.SolvedScheduleJson,
+                                body.AnalyzeResponseJson,
+                                cancellationToken)
                             .ConfigureAwait(false);
                         return Results.Ok(result);
                     }

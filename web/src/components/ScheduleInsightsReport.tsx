@@ -3,33 +3,41 @@ function stripLeadingBullet(text: string): string {
 }
 
 type Props = {
-  /** Top Gemini insights (at most 3), shown as cards. */
+  title?: string;
+  description?: string;
+  /** Gemini insights, shown as cards. */
   insights?: string[] | null;
   loading?: boolean;
   error?: string | null;
+  /** How many cards to show (scheduling uses more when analyze+constraints). */
+  maxItems?: number;
 };
 
 export function ScheduleInsightsReport({
+  title = "Schedule insights",
+  description = "AI suggestions from your solved schedule (Gemini). Review before changing assignments.",
   insights = null,
   loading = false,
   error = null,
+  maxItems = 3,
 }: Props) {
-  const top = (insights ?? []).slice(0, 3).map(stripLeadingBullet).filter(Boolean);
+  const top = (insights ?? []).slice(0, maxItems).map(stripLeadingBullet).filter(Boolean);
 
   if (!loading && error === null && top.length === 0) {
     return null;
   }
 
+  const colsClass =
+    maxItems <= 3 ? "sm:grid-cols-3" : "sm:grid-cols-2 lg:grid-cols-3";
+
   return (
     <div className="mt-4 rounded-2xl border border-white/10 bg-slate-900/80 px-4 py-4 sm:px-5">
-      <h3 className="text-sm font-semibold text-white">Schedule insights</h3>
-      <p className="mt-1 text-xs text-slate-500">
-        AI suggestions from your solved schedule (Gemini). Review before changing assignments.
-      </p>
+      <h3 className="text-sm font-semibold text-white">{title}</h3>
+      <p className="mt-1 text-xs text-slate-500">{description}</p>
 
       {loading && (
-        <div className="mt-4 grid gap-3 sm:grid-cols-3">
-          {[0, 1, 2].map((i) => (
+        <div className={`mt-4 grid gap-3 ${colsClass}`}>
+          {Array.from({ length: Math.min(6, maxItems) }, (_, i) => i).map((i) => (
             <div
               key={i}
               className="animate-pulse rounded-xl border border-white/10 bg-slate-950/60 px-3 py-4"
@@ -48,7 +56,7 @@ export function ScheduleInsightsReport({
       )}
 
       {!loading && error === null && top.length > 0 && (
-        <div className="mt-4 grid gap-3 sm:grid-cols-3">
+        <div className={`mt-4 grid gap-3 ${colsClass}`}>
           {top.map((text, idx) => (
             <div
               key={idx}
